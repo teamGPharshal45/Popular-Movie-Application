@@ -1,3 +1,644 @@
-# Default ignored files
-/shelf/
-/workspace.xml
+package com.imobile3.pos.data.module.batch.close;
+
+import android.app.Activity;
+import android.database.Cursor;
+import android.os.AsyncTask;
+import android.os.Handler;
+import android.text.TextUtils;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.annotation.StringRes;
+
+import com.imobile3.pos.R;
+import com.imobile3.pos.audits.constants.enums.AuditEvent;
+import com.imobile3.pos.audits.constants.enums.AuditLevel;
+import com.imobile3.pos.audits.utils.AuditHelper;
+import com.imobile3.pos.data.async.BaseAsyncUtilHelper;
+import com.imobile3.pos.data.audit.FinancialAuditHelper;
+import com.imobile3.pos.data.audit.LogEventHelper;
+import com.imobile3.pos.data.flavor.FlavorHelper;
+import com.imobile3.pos.data.module.batch.BatchHelper;
+import com.imobile3.pos.data.module.account.RuntimeConfigHelper;
+import com.imobile3.pos.data.module.account.repository.UserHelper;
+import com.imobile3.pos.data.peripherals.terminal.TerminalHelper;
+import com.imobile3.pos.data.peripherals.terminal.TerminalHelperCallbacks;
+import com.imobile3.pos.library.constants.enums.PaymentTerminalAction;
+import com.imobile3.pos.library.constants.enums.TenderRecordStatus;
+import com.imobile3.pos.library.constants.enums.TransactionRecordStatus;
+import com.imobile3.pos.library.database.transaction.accessObjects.TransactionsDao;
+import com.imobile3.pos.library.domainobjects.PaymentTerminalError;
+import com.imobile3.pos.library.domainobjects.PaymentTerminalRequest;
+import com.imobile3.pos.library.domainobjects.PaymentTerminalResponse;
+import com.imobile3.pos.library.domainobjects.TenderAdditionalInfo;
+import com.imobile3.pos.library.domainobjects.TxDbBatch;
+import com.imobile3.pos.library.domainobjects.TxDbTender;
+import com.imobile3.pos.library.interfaces.terminal.iM3Terminal;
+import com.imobile3.pos.library.utils.LogHelper;
+import com.imobile3.pos.library.webservices.enums.TenderCreditStatusType;
+import com.imobile3.pos.ui.ResourceHelper;
+
+import java.lang.ref.WeakReference;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+
+public class TerminalBatchCloseHelper extends BaseAsyncUtilHelper {
+
+    private static final String TAG = "TerminalBatchCloseHelper";
+
+    private static final boolean VERBOSE_LOGGING = true;
+
+    private static final AtomicBoolean IS_RUNNING = new AtomicBoolean(false);
+
+    private TxDbBatch mBatch;
+    private int mCompletedCount, mTotalCount;
+    private boolean mWaitingForTerminalResponse, mBatchCloseSuccess, mHasError;
+    private PaymentTerminalResponse mPaymentTerminalResponse;
+
+    /**
+     * Keep track of whether the UploadSafTenders response returned 'NOT FOUND'
+     */
+    private boolean mReceivedSafNotFoundResponseForBatchAction;
+
+    private TransactionsDao mTransactionsDao;
+    private Cursor mTenderCursor;
+    private Handler mHandler;
+
+    private static boolean sIsCancelled;
+
+    private iM3Terminal mTerminal;
+
+    @Nullable
+    private static Set<TerminalBatchCloseCallbacks> sCallbacks;
+
+    public interface TerminalBatchCloseCallbacks {
+        void TerminalBatchCloseOnSafUploadInProgress(int current, int totalCount);
+
+        void TerminalBatchCloseOnSafUploadComplete(int current, int totalCount);
+
+        void TerminalBatchCloseOnSafTendersNotFound();
+
+        void TerminalBatchCloseOnInProgress();
+
+        void TerminalBatchCloseOnComplete();
+
+        void TerminalBatchCloseOnCancelled();
+
+        void TerminalBatchCloseOnBusy();
+
+        void TerminalBatchCloseOnTerminalConfigurationError(String message);
+
+        void TerminalBatchCloseOnError();
+    }
+
+    /**
+     * Starts the SAF update & batch close task on the terminal
+     *
+     * @param activity context required for terminal initialization
+     * @param batch batch to use for SAF tender search
+     * @param callbacks optional callbacks
+     */
+    public TerminalBatchCloseHelper(Activity activity, TxDbBatch batch,
+            TerminalBatchCloseCallbacks callbacks) {
+        if (activity == null
+                || batch == null
+                || batch.getBatchNumber() <= 0) {
+            throw new IllegalArgumentException("invalid context and/or batch");
+        }
+
+        mHandler = new Handler(activity.getMainLooper());
+
+        if (IS_RUNNING.compareAndSet(false, true)) {
+            mBatch = batch;
+            addCallbacks(callbacks);
+
+            mTransactionsDao = new TransactionsDao(getAPP());
+            mTerminal = TerminalHelper.getTerminal(activity, new TerminalCallbacks());
+
+            if (mTerminal == null) {
+                logEvent("No terminal configured, shutting down");
+                callbackTerminalConfigurationError(
+                        getString(R.string.payment_method_dialog_terminal_notconfigured));
+                IS_RUNNING.set(false);
+                return;
+            } else if (TerminalHelper.isSetupRequired() && !mTerminal.isTerminalSetupComplete()) {
+                logEvent("Terminal not setup, shutting down");
+                callbackTerminalConfigurationError(
+                        getString(R.string.payment_method_dialog_terminal_notsetup));
+                IS_RUNNING.set(false);
+                return;
+            }
+
+            new TerminalBatchCloseTask(activity).executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        } else {
+            logEvent("Already running, ignoring request");
+            callbackOnBusy();
+        }
+    }
+
+    public static boolean isRunning() {
+        return IS_RUNNING.get();
+    }
+
+    public static void addCallbacks(@NonNull TerminalBatchCloseCallbacks callbacks) {
+        if (sCallbacks == null) {
+            sCallbacks = new HashSet<>();
+        }
+        sCallbacks.add(callbacks);
+    }
+
+    public static void removeCallbacks(@Nullable TerminalBatchCloseCallbacks callbacks) {
+        if (sCallbacks == null || callbacks == null) {
+            return;
+        }
+        sCallbacks.remove(callbacks);
+        if (sCallbacks.isEmpty()) {
+            sCallbacks = null;
+        }
+    }
+
+    public static void cancel() {
+        sIsCancelled = true;
+    }
+
+    private class TerminalBatchCloseTask extends AsyncTask<Void, Void, Void> {
+
+        @NonNull
+        private final WeakReference<Activity> mActivityReference;
+
+        private TerminalBatchCloseTask(@NonNull Activity activity) {
+            mActivityReference = new WeakReference<>(activity);
+        }
+
+        @Override
+        protected void onPreExecute() {
+            super.onPreExecute();
+            sIsCancelled = false;
+            logEvent("BEGIN TASK");
+        }
+
+        @Override
+        protected Void doInBackground(Void... voids) {
+            mTenderCursor = mTransactionsDao.getStoreAndForwardTenders(mBatch.getBatchNumber());
+
+            mTotalCount = mTenderCursor.getCount();
+            if (mTotalCount > 0) {
+                auditEvent("SAF tenders in local batch, instructing terminal to upload");
+                callbackSafUploadInProgress();
+                uploadSafTenders();
+            } else {
+                auditEvent("No SAF tenders in local batch");
+                callbackSafTendersNotFound();
+                closeBatch();
+            }
+
+            mTenderCursor.close();
+
+            return null;
+        }
+
+        @Override
+        protected void onPostExecute(Void args) {
+            super.onPostExecute(args);
+            IS_RUNNING.set(false);
+            logEvent("END TASK");
+        }
+
+        private void uploadSafTenders() {
+            mPaymentTerminalResponse = null;
+            mWaitingForTerminalResponse = true;
+            mReceivedSafNotFoundResponseForBatchAction = false;
+            mTerminal.sendRequest(
+                    new PaymentTerminalRequest(PaymentTerminalAction.UploadSafTenders,
+                            RuntimeConfigHelper.isDemoMode()));
+
+            while (mWaitingForTerminalResponse) {
+                pause(500);
+            }
+
+            handleSafUploadResponse(mPaymentTerminalResponse);
+        }
+
+        private void handleSafUploadResponse(PaymentTerminalResponse response) {
+            if (response == null) {
+                auditEvent("Error with terminal SAF upload");
+                callbackOnError();
+            } else if (response.isSafTenderNotFound()) {
+                auditEvent("No SAF tenders found on terminal");
+                mReceivedSafNotFoundResponseForBatchAction = true;
+                if (sIsCancelled) {
+                    callbackOnCancelled();
+                } else {
+                    if (mHasError) {
+                        callbackOnError();
+                    } else {
+                        if (mTotalCount > 0) {
+                            // still need to update our local SAF tender records
+                            updateRemainingTenders();
+                        } else {
+                            callbackSafUploadComplete();
+                            closeBatch();
+                        }
+                    }
+                }
+            } else {
+                updateRemainingTenders();
+            }
+        }
+
+        private void updateRemainingTenders() {
+            LogHelper.invoked(Level.FINE, TAG);
+            outerloop:
+            do {
+                // "refresh" cursor after each full pass to take tender modifications into account
+                mTenderCursor.close();
+                mTenderCursor = mTransactionsDao.getStoreAndForwardTenders(mBatch.getBatchNumber());
+                if (!mTenderCursor.moveToFirst()) {
+                    LogHelper.write(TAG, "Cursor empty, breaking outer loop");
+                    break;
+                }
+                do {
+                    if (sIsCancelled) {
+                        LogHelper.write(TAG, "Cancelled, breaking outer loop");
+                        break outerloop;
+                    }
+
+                    TxDbTender tender = mTransactionsDao.getTxDbTenderFromCursor(mTenderCursor);
+                    String tenderSafId = tender.getAdditionalInfo().getTerminalTenderSafId();
+
+                    auditSafTenderProcessing("Getting SAF tender info from terminal",
+                            tender, null);
+
+                    mPaymentTerminalResponse = null;
+                    mWaitingForTerminalResponse = true;
+                    mTerminal.sendRequest(
+                            new PaymentTerminalRequest(PaymentTerminalAction.GetSafTender,
+                                    RuntimeConfigHelper.isDemoMode())
+                                    .setCustomData(FlavorHelper.getCustomTerminalRequestData())
+                                    .setTerminalTenderSafId(tenderSafId));
+
+                    while (mWaitingForTerminalResponse) {
+                        pause(500);
+                    }
+
+                    handleTenderResponse(tender, mPaymentTerminalResponse);
+
+                    callbackSafUploadInProgress();
+                } while (mTenderCursor.moveToNext());
+            } while (mCompletedCount < mTotalCount);
+
+            mTenderCursor.close();
+
+            if (sIsCancelled) {
+                callbackOnCancelled();
+            } else {
+                if (mHasError) {
+                    callbackOnError();
+                } else {
+                    callbackSafUploadComplete();
+                    closeBatch();
+                }
+            }
+        }
+
+        // Keep track of whether the UploadSafTenders response returned 'NOT FOUND'
+        private boolean mWasClearBatchSafTenderNotFound;
+
+        private boolean wasClearBatchSafTenderNotFound() {
+            return mWasClearBatchSafTenderNotFound;
+        }
+
+        private void handleTenderResponse(TxDbTender tender, PaymentTerminalResponse response) {
+            if (response == null) {
+                auditSafTenderProcessing("No SAF tender info returned from terminal",
+                        tender, response);
+            } else if (response.isSafTenderUploaded()) {
+                if (response.isSafTenderDeclined()) {
+                    FinancialAuditHelper.cardTokenState(
+                            "TerminalBatchCloseHelper -> SAF tender DECLINED",
+                            tender.getTenderNumber(),
+                            response.getApprovedAmount(),
+                            response.getRedactedInfo(),
+                            response.getGatewayCardToken()
+                    );
+
+                    TenderCreditStatusType tenderCreditStatusType = TenderCreditStatusType.Declined;
+                    if (!TextUtils.isEmpty(response.getGatewayCardToken())) {
+                        tenderCreditStatusType = TenderCreditStatusType.DeclinedRetry;
+                    }
+                    auditSafTenderProcessing(
+                            "SAF tender DECLINED, setting TenderCreditStatusType to " +
+                                    tenderCreditStatusType, tender, response);
+                    mTransactionsDao.updateTender(tender.getTransactionNumber(),
+                            tender.getTenderNumber(), TenderRecordStatus.Finalized,
+                            tenderCreditStatusType, response.getGatewayAuthCode(),
+                            getUpdatedAdditionalInfo(tender, response), new Date());
+                } else {
+                    FinancialAuditHelper.cardTokenState(
+                            "TerminalBatchCloseHelper -> SAF tender APPROVED",
+                            tender.getTenderNumber(),
+                            response.getApprovedAmount(),
+                            response.getRedactedInfo(),
+                            response.getGatewayCardToken()
+                    );
+
+                    auditSafTenderProcessing("SAF tender APPROVED", tender, response);
+                    mTransactionsDao.updateTender(tender.getTransactionNumber(),
+                            tender.getTenderNumber(), TenderRecordStatus.Finalized,
+                            TenderCreditStatusType.Completed, response.getGatewayAuthCode(),
+                            getUpdatedAdditionalInfo(tender, response), new Date());
+                }
+                mTransactionsDao.updateTransaction(tender.getTransactionNumber(),
+                        new Date(), UserHelper.getUserId(), TransactionRecordStatus.ReadyToUpload);
+            } else if (response.isSafTenderNotFound() ||
+                    hasReceivedSafNotFoundResponseForBatchAction()) {
+                // some terminals remove SAF tenders when voided/refunded, so mark as complete
+                auditSafTenderProcessing(
+                        "SAF tender not found on terminal (offline void), setting TenderCreditStatusType to Completed",
+                        tender, response);
+                mTransactionsDao.updateTender(tender.getTransactionNumber(),
+                        tender.getTenderNumber(), TenderRecordStatus.Finalized,
+                        TenderCreditStatusType.Completed, response.getGatewayAuthCode(),
+                        tender.getAdditionalInfo(), new Date());
+                mTransactionsDao.updateTransaction(tender.getTransactionNumber(),
+                        new Date(), UserHelper.getUserId(), TransactionRecordStatus.ReadyToUpload);
+            } else {
+                // not uploaded yet
+                auditSafTenderProcessing("SAF tender not uploaded yet", tender, response);
+                return;
+            }
+
+            mCompletedCount++;
+        }
+
+        /**
+         * We received a 'Not Found' response for either Batch Close or Batch Clear, so when we do
+         * LOCAL DETAIL REPORTS, the tenders may be approved, or uploaded, or not uploaded, or not
+         * found.
+         */
+        private boolean hasReceivedSafNotFoundResponseForBatchAction() {
+            return mReceivedSafNotFoundResponseForBatchAction;
+        }
+
+        private TenderAdditionalInfo getUpdatedAdditionalInfo(TxDbTender tender,
+                PaymentTerminalResponse response) {
+            TenderAdditionalInfo additionalInfo = tender.getAdditionalInfo();
+            if (response.getGatewayIdentifier() != null) {
+                additionalInfo.setGatewayIdentifier(response.getGatewayIdentifier());
+            }
+            if (response.getGatewayGroupIdentifier() != null) {
+                additionalInfo.setGatewayGroupIdentifier(response.getGatewayGroupIdentifier());
+            }
+            if (response.getGatewayAuthDateTime() != null) {
+                additionalInfo.setGatewayAuthDateTime(response.getGatewayAuthDateTime());
+            }
+            if (response.getGatewayAuthResponse() != null) {
+                additionalInfo.setGatewayAuthResponse(response.getGatewayAuthResponse());
+            }
+            if (response.getGatewayCardToken() != null) {
+                additionalInfo.setGatewayCardToken(response.getGatewayCardToken());
+            }
+            additionalInfo.setSwiperType(response.getSwiperType());
+
+            return additionalInfo;
+        }
+
+        private void closeBatch() {
+            Activity activity = mActivityReference.get();
+            if (activity == null) {
+                mBatchCloseSuccess = false;
+                callbackOnError();
+                return;
+            }
+
+            PaymentTerminalAction action = PaymentTerminalAction.CloseBatch;
+
+            // for scholastic just clear the terminal batch, don't close it
+            if (FlavorHelper.isScholastic()) {
+                action = PaymentTerminalAction.ClearBatch;
+            }
+
+            String userId = String.valueOf(UserHelper.getUserId());
+            auditEvent("UserId: " + userId + " instructing terminal to close batch");
+
+            callbackBatchCloseInProgress();
+
+            mPaymentTerminalResponse = null;
+            mWaitingForTerminalResponse = true;
+            mTerminal.sendRequest(new PaymentTerminalRequest(action)
+                    .setActivityClassToForeground(activity.getClass())
+                    .setCustomData(FlavorHelper.getCustomTerminalRequestData())
+                    .setUserId(userId));
+
+            while (mWaitingForTerminalResponse) {
+                pause(500);
+            }
+
+            if (mBatchCloseSuccess) {
+                callbackOnComplete();
+            } else if (sIsCancelled) {
+                callbackOnCancelled();
+            } else {
+                callbackOnError();
+            }
+        }
+    }
+
+    // terminal callbacks
+
+    private class TerminalCallbacks extends TerminalHelperCallbacks {
+        @Override
+        public void iM3TerminalOnResponse(PaymentTerminalResponse response) {
+            auditEvent("TerminalBatchCloseHelper terminal response action: "
+                    + response.getAction() + " / response object instance: " + response.hashCode());
+            switch (response.getAction()) {
+                case SendMessage:
+                    // Ignore all message events.
+                    return;
+
+                case UploadSafTenders:
+                case GetSafTender:
+                    mPaymentTerminalResponse = response;
+                    break;
+
+                case CloseBatch:
+                case ClearBatch:
+                    if (!response.isTerminalBatchEmpty()) {
+                        FinancialAuditHelper.terminalBatchClosed(TAG,
+                                BatchHelper.getCurrentBatchNumber(),
+                                BatchHelper.getCurrentLocalBatchNumber(), response);
+                    }
+                    mBatchCloseSuccess = true;
+                    break;
+
+                default:
+                    logEvent("Unsupported PaymentTerminalAction: " + response.getAction());
+            }
+
+            mWaitingForTerminalResponse = false;
+        }
+
+        @Override
+        public void iM3TerminalOnError(@NonNull PaymentTerminalError error) {
+            String friendlyMessage = error.getFriendlyMessage();
+            String detailedMessage = error.getDetailedMessage();
+            auditEvent("TerminalBatchCloseHelper terminal error: " + friendlyMessage +
+                    (detailedMessage != null ? " / " + detailedMessage : ""));
+            mHasError = true;
+            mBatchCloseSuccess = false;
+            mWaitingForTerminalResponse = false;
+            mReceivedSafNotFoundResponseForBatchAction = false;
+        }
+    }
+
+    // helpers
+
+    private void logEvent(String message) {
+        if (VERBOSE_LOGGING) {
+            LogHelper.write(TAG, message);
+        }
+    }
+
+    private void auditEvent(String message) {
+        LogEventHelper.saveEvent(AuditLevel.Debug, TAG, message + " (Batch number: "
+                + BatchHelper.getCurrentBatchNumber() + " / "
+                + BatchHelper.getCurrentLocalBatchNumber() + ")");
+    }
+
+    private void auditSafTenderProcessing(@NonNull String description,
+            @NonNull TxDbTender tender, @Nullable PaymentTerminalResponse response) {
+        String message = "TerminalBatchCloseHelper -> " + description + ":"
+                + " Cursor object instance " + mTenderCursor.hashCode()
+                + " / Tender object instance " + tender.hashCode()
+                + " / TenderNumber " + tender.getTenderNumber()
+                + " / Tender TotalAmount " + tender.getTotalAmount()
+                + " / Tender RedactedInfo " + tender.getRedactedInfo();
+
+        TenderAdditionalInfo additionalInfo = tender.getAdditionalInfo();
+        if (additionalInfo != null) {
+            message += " / TerminalTenderSafId " + additionalInfo.getTerminalTenderSafId()
+                    + " / TerminalTenderId " + additionalInfo.getTerminalTenderId()
+                    + " / TerminalTenderId " + additionalInfo.getTerminalTenderId()
+            ;
+        }
+
+        if (response != null) {
+            message += " Response object instance " + response.hashCode()
+                    + " / Response ApprovedAmount " + response.getApprovedAmount()
+                    + " / Response RedactedInfo " + response.getRedactedInfo()
+                    + " / Response GatewayCardToken " + response.getGatewayCardToken()
+                    + " / Response GatewayAuthCode " + response.getGatewayAuthCode()
+                    + " / Response GatewayAuthDateTime " + response.getGatewayAuthDateTime()
+            ;
+        }
+
+        auditEvent(message);
+    }
+
+    // callbacks
+
+    private void callbackSafUploadInProgress() {
+        // Lock in the values at the time this method was invoked.
+        final int completed = mCompletedCount;
+        final int total = mTotalCount;
+
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnSafUploadInProgress(completed, total);
+                }
+            }
+        });
+    }
+
+    private void callbackSafUploadComplete() {
+        // Lock in the values at the time this method was invoked.
+        final int completed = mCompletedCount;
+        final int total = mTotalCount;
+
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnSafUploadComplete(completed, total);
+                }
+            }
+        });
+    }
+
+    private void callbackSafTendersNotFound() {
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnSafTendersNotFound();
+                }
+            }
+        });
+    }
+
+    private void callbackBatchCloseInProgress() {
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnInProgress();
+                }
+            }
+        });
+    }
+
+    private void callbackOnComplete() {
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnComplete();
+                }
+            }
+        });
+    }
+
+    private void callbackOnCancelled() {
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnCancelled();
+                }
+            }
+        });
+    }
+
+    private void callbackOnBusy() {
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnBusy();
+                }
+            }
+        });
+    }
+
+    private void callbackTerminalConfigurationError(final String message) {
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnTerminalConfigurationError(message);
+                }
+            }
+        });
+    }
+
+    private void callbackOnError() {
+        mHandler.post(() -> {
+            if (sCallbacks != null) {
+                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
+                    callbacks.TerminalBatchCloseOnError();
+                }
+            }
+        });
+    }
+
+    private String getString(@StringRes int resourceId) {
+        return ResourceHelper.getString(resourceId);
+    }
+}
