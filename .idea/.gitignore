@@ -654,3 +654,522 @@ public class TerminalBatchCloseHelper extends BaseAsyncUtilHelper {
     public Context getTargetContext() {
         return getInstrumentation().getTargetContext();
     }
+
+
+
+
+
+
+
+
+
+
+
+package com.imobile3.pos.data.peripherals.terminal;
+
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.TextUtils;
+
+import com.imobile3.pos.BaseUnitTest;
+import com.imobile3.pos.R;
+import com.imobile3.pos.audits.constants.enums.AuditEvent;
+import com.imobile3.pos.audits.utils.AuditHelper;
+import com.imobile3.pos.data.peripherals.terminal.TerminalRequestProcessor.Callbacks;
+import com.imobile3.pos.library.constants.enums.PaymentTerminalAction;
+import com.imobile3.pos.library.domainobjects.PaymentTerminalError;
+import com.imobile3.pos.library.domainobjects.PaymentTerminalRequest;
+import com.imobile3.pos.library.domainobjects.PaymentTerminalResponse;
+import com.imobile3.pos.library.interfaces.terminal.iM3Terminal;
+import com.imobile3.pos.library.interfaces.terminal.iM3TerminalCallbacks;
+import com.imobile3.pos.library.utils.LogHelper;
+import com.imobile3.pos.library.webservices.enums.SupportedHardware;
+import com.imobile3.pos.utils.ReflectionHelper;
+
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.MockedConstruction;
+import org.mockito.MockedStatic;
+import org.mockito.stubbing.Answer;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+public class TerminalRequestProcessorTest extends BaseUnitTest {
+
+    private final String mTag = TerminalRequestProcessor.class.getName();
+    private final List<SupportedHardware> mTerminals =
+            Collections.singletonList(SupportedHardware.PaxASeriesPrinter);
+    private TerminalRequestProcessor mTerminalRequestProcessor;
+    private final PaymentTerminalRequest mRequest = mock(PaymentTerminalRequest.class);
+    private final Callbacks mCallbacks = mock(Callbacks.class);
+    private final iM3Terminal mTerminal = mock(iM3Terminal.class);
+    private Context mContext;
+    private MockedStatic<TerminalHelper> mTerminalHelper;
+    private MockedStatic<LogHelper> mLogHelper;
+    private MockedStatic<AuditHelper> mAuditHelper;
+    private MockedConstruction<Handler> mHandlerConstruction;
+
+    @Before
+    @Override
+    public void setUp() {
+        super.setUp();
+
+        mContext = getApplication();
+
+        mTerminalHelper = mockStatic(TerminalHelper.class);
+        mLogHelper = mockStatic(LogHelper.class);
+        mAuditHelper = mockStatic(AuditHelper.class);
+
+        mTerminalRequestProcessor = new TerminalRequestProcessor();
+
+        Looper looper = mock(Looper.class);
+        when(mContext.getMainLooper()).thenReturn(looper);
+
+        mHandlerConstruction = mockConstruction(Handler.class);
+    }
+
+    @After
+    @Override
+    public void tearDown() {
+        super.tearDown();
+
+        mTerminalHelper.close();
+        mLogHelper.close();
+        mAuditHelper.close();
+        mHandlerConstruction.close();
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_shouldLogFailure_ifTerminalsAreNull() {
+        String failureMessage = "Available terminals list is null.";
+        String logMessage = "processRequestAgainstAvailableTerminals() Available terminals " +
+                "is null or empty";
+
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(null);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        verifyAuditHelper(logMessage);
+        verify(mCallbacks).onRequestFailure(failureMessage);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_shouldLogFailure_ifTerminalsAreEmpty() {
+        String failureMessage = "Available terminals list is null.";
+        String logMessage = "processRequestAgainstAvailableTerminals() Available terminals " +
+                "is null or empty";
+
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(new ArrayList<>());
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        verifyAuditHelper(logMessage);
+        verify(mCallbacks).onRequestFailure(failureMessage);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifTerminalInstanceIsNull() {
+        String terminalInstanceLogMessage = "processAction() Terminal instance is null. " +
+                "TerminalIndex = 0; SupportedHardwareTerminal = PaxASeriesPrinter";
+        String terminalIndexLogMessage = "processAction() All attempts to retrieve the serial " +
+                "number from the provided terminals failed. TerminalIndex = 1; Terminals.Size = 1";
+        String failureMessage =
+                String.valueOf(R.string.terminal_request_processor_all_attempts_failed_format);
+
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(mTerminals);
+        when(mContext.getString(anyInt())).then(returnArgumentsAsString());
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        verify(mCallbacks).onShowProgress();
+        verifyLogHelper(terminalInstanceLogMessage);
+        verify(mCallbacks).onNullTerminalFound();
+        verifyLogHelper(terminalIndexLogMessage);
+        verify(mCallbacks).onRequestFailure(failureMessage);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifHandlerPostDelayedIsCalled() {
+        String logMessage = "processAction() Sending request to terminal instance: " + mTerminal +
+                "; Action = null; TerminalIndex = 0; IndividualRetryCount = 0";
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                new ArrayList<>(Collections.nCopies(1, SupportedHardware.CodeCR950));
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+        when(TerminalHelper
+                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
+                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        verifyHandler();
+        verify(mCallbacks).onShowProgress();
+        verify(mTerminal).sendRequest(mRequest);
+        verifyLogHelper(logMessage);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifMaxSupportedTerminalsNumberReached() {
+        PaymentTerminalAction paymentTerminalAction = PaymentTerminalAction.Activate;
+        String logMessage = "processAction() Too many terminals are configured; " +
+                "Did you want this process to take forever? TerminalIndex = 51; Terminals.Size = 52";
+        String failureMessage = String.format("%s, %s",
+                R.string.terminal_request_processor_max_supported_terminal_format,
+                paymentTerminalAction);
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                new ArrayList<>(Collections.nCopies(52, SupportedHardware.CodeCR950));
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+
+        // Mock mTerminalIndex
+        AtomicInteger terminalIndex = mock(AtomicInteger.class);
+        when(terminalIndex.get()).thenReturn(51);
+        ReflectionHelper.setFieldValue(mTerminalRequestProcessor, "mTerminalIndex", terminalIndex);
+
+        when(mRequest.getAction()).thenReturn(paymentTerminalAction);
+        when(mContext.getString(anyInt(), any(PaymentTerminalAction.class)))
+                .then(returnArgumentsAsString());
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        verify(mCallbacks).onShowProgress();
+        verifyLogHelper(logMessage);
+        verify(mCallbacks).onRequestFailure(failureMessage);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifIndividualRetryNumberReached() {
+        String logMessage = "processAction() Exhausted all retry attempts against current " +
+                "terminal. SupportedHardwareTerminal = CodeCR950; IndividualRetryCount = 4";
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                new ArrayList<>(Collections.nCopies(2, SupportedHardware.CodeCR950));
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+
+        // Mock mIndividualTerminalRetryCount
+        AtomicInteger terminalIndex = mock(AtomicInteger.class);
+        when(terminalIndex.get()).thenReturn(4);
+        ReflectionHelper.setFieldValue(mTerminalRequestProcessor, "mIndividualTerminalRetryCount",
+                terminalIndex);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        verify(mCallbacks).onShowProgress();
+
+        mLogHelper.verify(() -> LogHelper.write(mTag, logMessage), times(2));
+
+        // Check if mTerminalIndex is incremented
+        assertPrivateMember("mTerminalIndex", 2);
+
+        // Check if mIndividualTerminalRetryCount is incremented
+        assertPrivateMember("mIndividualTerminalRetryCount", 4);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifNewTerminalInstanceIsNotNull() {
+        String exhaustedAttemptsLogMessage =
+                "processAction() Exhausted all retry attempts against current " +
+                        "terminal. SupportedHardwareTerminal = CodeCR950; IndividualRetryCount = 4";
+        String forceDisconnectLogMessage =
+                "processAction() Sending ForceDisconnect action to terminal: " + mTerminal;
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                new ArrayList<>(Collections.nCopies(2, SupportedHardware.CodeCR950));
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+
+        // Mock mIndividualTerminalRetryCount
+        AtomicInteger terminalIndex = mock(AtomicInteger.class);
+        when(terminalIndex.get()).thenReturn(4);
+        ReflectionHelper.setFieldValue(mTerminalRequestProcessor, "mIndividualTerminalRetryCount",
+                terminalIndex);
+
+        // Mock mNewTerminalInstance
+        ReflectionHelper.setFieldValue(mTerminalRequestProcessor, "mNewTerminalInstance",
+                mTerminal);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        verify(mCallbacks).onShowProgress();
+
+        mLogHelper.verify(() -> LogHelper.write(mTag, exhaustedAttemptsLogMessage), times(2));
+        verifyLogHelper(forceDisconnectLogMessage);
+
+        // Check if mNewTerminalInstance is set to null
+        iM3Terminal expectedTerminalInstance =
+                ReflectionHelper.getFieldValue(mTerminalRequestProcessor, "mNewTerminalInstance");
+        assertNull(expectedTerminalInstance);
+
+        // Check if mTerminalIndex is incremented
+        assertPrivateMember("mTerminalIndex", 2);
+
+        // Check if mIndividualTerminalRetryCount is incremented
+        assertPrivateMember("mIndividualTerminalRetryCount", 4);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifResponseIsNull() {
+        String logMessage = "processAction()->iM3TerminalOnResponse() Response from terminal is " +
+                "null, ignoring.";
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                Collections.singletonList(SupportedHardware.CodeCR950);
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+        when(TerminalHelper
+                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
+                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        // Set null Payment Terminal response
+        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
+        callbacks.iM3TerminalOnResponse(null);
+
+        verifyLogHelper(logMessage);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifResponseActionIsNotAuth() {
+        PaymentTerminalAction paymentTerminalAction = PaymentTerminalAction.Auth;
+        String logMessage = "processAction()->iM3TerminalOnResponse() Response contains an " +
+                "erroneous action: Activate; ignoring.";
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                Collections.singletonList(SupportedHardware.CodeCR950);
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+        when(TerminalHelper
+                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
+                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
+        when(mRequest.getAction()).thenReturn(paymentTerminalAction);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        // Set Payment Terminal response
+        PaymentTerminalResponse paymentTerminalResponse = mock(PaymentTerminalResponse.class);
+        when(paymentTerminalResponse.getAction()).thenReturn(PaymentTerminalAction.Activate);
+
+        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
+        callbacks.iM3TerminalOnResponse(paymentTerminalResponse);
+
+        verifyLogHelper(logMessage);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifRequestActionIsGetSerial() {
+        PaymentTerminalAction paymentTerminalAction = PaymentTerminalAction.GetSerial;
+        String logMessage = "processAction()->iM3TerminalOnResponse() Response serial number " +
+                "is null, trying again.";
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                Collections.singletonList(SupportedHardware.CodeCR950);
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+        when(TerminalHelper
+                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
+                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
+        when(mRequest.getAction()).thenReturn(paymentTerminalAction);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        // Set Payment Terminal response
+        PaymentTerminalResponse paymentTerminalResponse = mock(PaymentTerminalResponse.class);
+        when(paymentTerminalResponse.getAction()).thenReturn(paymentTerminalAction);
+        when(paymentTerminalResponse.getTerminalSerialNumber()).thenReturn("");
+        when(TextUtils.isEmpty(anyString())).thenReturn(true);
+
+        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
+        callbacks.iM3TerminalOnResponse(paymentTerminalResponse);
+
+        verifyLogHelper(logMessage);
+
+        // Check if mIndividualTerminalRetryCount is incremented
+        assertPrivateMember("mIndividualTerminalRetryCount", 1);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifResponseTerminalInstanceIsNotNull() {
+        PaymentTerminalAction paymentTerminalAction = PaymentTerminalAction.Activate;
+        String forceDisconnectLogMessage = "processAction()->iM3TerminalOnResponse() Sending " +
+                "ForceDisconnect action to terminal: " + mTerminal;
+        String responseReceivedLogMessage = "processAction()->iM3TerminalOnResponse() Received " +
+                "response from device. Ending process...";
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                Collections.singletonList(SupportedHardware.CodeCR950);
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+        when(TerminalHelper
+                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
+                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
+        when(mRequest.getAction()).thenReturn(paymentTerminalAction);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        // Set Payment Terminal response
+        PaymentTerminalResponse paymentTerminalResponse = mock(PaymentTerminalResponse.class);
+        when(paymentTerminalResponse.getAction()).thenReturn(paymentTerminalAction);
+
+        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
+        callbacks.iM3TerminalOnResponse(paymentTerminalResponse);
+
+        verifyLogHelper(forceDisconnectLogMessage);
+        verifyLogHelper(responseReceivedLogMessage);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifPaymentTerminalError() {
+        String friendlyMessage = "FriendlyMessage";
+        String detailedMessage = "DetailedMessage";
+        String logMessage = "processAction()->iM3TerminalOnError() " + "Friendly = " +
+                friendlyMessage + "; Detailed = " + detailedMessage;
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                Collections.singletonList(SupportedHardware.CodeCR950);
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+        when(TerminalHelper
+                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
+                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        // Set Payment Terminal error
+        PaymentTerminalError paymentTerminalError = mock(PaymentTerminalError.class);
+        when(paymentTerminalError.getFriendlyMessage()).thenReturn(friendlyMessage);
+        when(paymentTerminalError.getDetailedMessage()).thenReturn(detailedMessage);
+        when(TextUtils.isEmpty(anyString())).thenReturn(true);
+
+        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
+        callbacks.iM3TerminalOnError(paymentTerminalError);
+
+        verifyLogHelper(logMessage);
+
+        // Check if mIndividualTerminalRetryCount is incremented
+        assertPrivateMember("mIndividualTerminalRetryCount", 1);
+    }
+
+    @Test
+    public void testProcessRequestAgainstAvailableTerminals_ifTerminalErrorAndDetailedMessageIsNull() {
+        String detailedMessage = "DetailedMessage";
+        String logMessage = "iM3TerminalOnError:" + detailedMessage + "; RequestedAction:Auth";
+
+        // Mock maximum number of terminal
+        List<SupportedHardware> maxNumberOfTerminals =
+                Collections.singletonList(SupportedHardware.CodeCR950);
+        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
+        when(TerminalHelper
+                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
+                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
+        when(mRequest.getAction()).thenReturn(PaymentTerminalAction.Auth);
+
+        mTerminalRequestProcessor
+                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
+
+        // Set Payment Terminal error
+        PaymentTerminalError paymentTerminalError = mock(PaymentTerminalError.class);
+        when(paymentTerminalError.getDetailedMessage()).thenReturn(detailedMessage);
+        when(TextUtils.isEmpty(anyString())).thenReturn(false);
+
+        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
+        callbacks.iM3TerminalOnError(paymentTerminalError);
+
+        mAuditHelper.verify(() -> AuditHelper.d(mTag, AuditEvent.Generic, logMessage));
+
+        // Check if mIndividualTerminalRetryCount is incremented
+        assertPrivateMember("mIndividualTerminalRetryCount", 1);
+    }
+
+    private iM3TerminalCallbacks captureTerminalCallbacks() {
+        // Create the iM3TerminalCallbacks captor
+        ArgumentCaptor<iM3TerminalCallbacks> captor =
+                ArgumentCaptor.forClass(iM3TerminalCallbacks.class);
+
+        // Verify that TerminalHelper.getUnconfiguredTermina() was called with the any first, second
+        // arguments and captor.capture() as the third argument, which is where the
+        // iM3TerminalCallbacks object is captured
+        mTerminalHelper.verify(() -> TerminalHelper.getUnconfiguredTerminal(any(Context.class),
+                any(SupportedHardware.class),
+                captor.capture()));
+
+        return captor.getValue();
+    }
+
+    private void verifyHandler() {
+        // Create the Runnable captor
+        ArgumentCaptor<Runnable> captor = ArgumentCaptor.forClass(Runnable.class);
+
+        Handler handler = mHandlerConstruction.constructed().get(0);
+        // Verify that postDelayed was called on the mock handler instance passing captor.capture()
+        // as the first argument, which is where the Runnable object is captured and anyLong() as
+        // the second argument
+        verify(handler).postDelayed(captor.capture(), anyLong());
+
+        // Get the captured Runnable object
+        Runnable runnable = captor.getValue();
+        runnable.run();
+    }
+
+    private void verifyAuditHelper(String expectedMessage) {
+        mAuditHelper.verify(() -> AuditHelper.w(mTag, AuditEvent.Generic, expectedMessage));
+    }
+
+    private void verifyLogHelper(String expectedMessage) {
+        mLogHelper.verify(() -> LogHelper.write(mTag, expectedMessage));
+    }
+
+    private void assertPrivateMember(String expectedName, int expectedValue) {
+        AtomicInteger actualValue =
+                ReflectionHelper.getFieldValue(mTerminalRequestProcessor, expectedName);
+        assertEquals(expectedValue, actualValue.get());
+    }
+
+    private Answer<String> returnArgumentsAsString() {
+        return invocation -> {
+            String separator = ", ";
+            StringBuilder result = new StringBuilder();
+
+            for (Object argument : invocation.getArguments()) {
+                result.append(argument.toString()).append(separator);
+            }
+
+            return result.substring(0, result.length() - separator.length());
+        };
+    }
+}
+
