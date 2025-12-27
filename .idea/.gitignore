@@ -642,3 +642,15 @@ public class TerminalBatchCloseHelper extends BaseAsyncUtilHelper {
         return ResourceHelper.getString(resourceId);
     }
 }
+
+
+
+
+
+
+
+
+ @Override
+    public Context getTargetContext() {
+        return getInstrumentation().getTargetContext();
+    }
