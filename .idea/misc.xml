@@ -26,3 +26,71 @@ public class BatchCloseTask extends BaseWebAsyncTask<Void, Void, Response<BatchD
                 WebServices.closeBatch(getAuthToken(), mRequest, mProcessId)));
     }
 }
+
+
+package com.imobile3.pos.data.async;
+
+import androidx.annotation.NonNull;
+import androidx.fragment.app.FragmentActivity;
+
+import com.imobile3.pos.data.module.account.RuntimeConfigHelper;
+import com.imobile3.pos.library.webservices.transferobjects.BaseDto;
+
+import java.util.Map;
+
+public abstract class BaseWebAsyncTask<Params, Progress, Result>
+        extends BaseAsyncTask<Params, Progress, Result> {
+
+    private String mProcessId;
+
+    public BaseWebAsyncTask(FragmentActivity activity) {
+        super(activity);
+    }
+
+    public BaseWebAsyncTask(FragmentActivity activity, String fragmentTag) {
+        super(activity, fragmentTag);
+    }
+
+    /**
+     * Gets the current AuthToken
+     */
+    @NonNull
+    public String getAuthToken() {
+        String authToken = RuntimeConfigHelper.getAuthToken();
+
+        if (authToken == null) {
+            return "";
+        }
+
+        return authToken;
+    }
+
+    /**
+     * Pause execution until the app is in the foreground
+     *
+     * @param responseDto the WebService command to process before pausing execution. Once
+     * execution resumes the resulting DTO will be returned.
+     */
+    protected <T extends BaseDto> T waitForForeground(T responseDto) {
+        // save any headers here if needed
+        if (responseDto != null) {
+            setAuthTokenExpiration(responseDto.getHttpHeaders());
+        }
+
+        while (!APP.isInForeground()) {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                // nothing
+            }
+        }
+        return responseDto;
+    }
+
+    private void setAuthTokenExpiration(Map<String, String> responseHeaders) {
+        if (responseHeaders != null) {
+            RuntimeConfigHelper.setAuthTokenExpiration(
+                    responseHeaders.get("Authorization-Token-Expires"));
+        }
+    }
+}
