@@ -1,96 +1,70 @@
-package com.imobile3.pos.data.module.batch.close;
+package com.imobile3.pos.data.module.batch.close
 
-import androidx.fragment.app.FragmentActivity;
+import android.annotation.SuppressLint
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import com.imobile3.pos.app.DateHelper
 
-import com.imobile3.pos.data.async.BaseWebAsyncTask;
-import com.imobile3.pos.library.domainobjects.Response;
-import com.imobile3.pos.library.webservices.WebServices;
-import com.imobile3.pos.library.webservices.transferobjects.BatchCloseDto;
-import com.imobile3.pos.library.webservices.transferobjects.BatchDto;
+import com.imobile3.pos.app.IntentHelper
+import com.imobile3.pos.app.constants.IntentExtras
+import com.imobile3.pos.library.utils.LogHelper
+import java.text.DateFormat
+import java.util.Locale
 
-public class BatchCloseTask extends BaseWebAsyncTask<Void, Void, Response<BatchDto>> {
+/**
+ * Helper class to Schedule Alarm manager for auto batch close.
+ * Alarm will be scheduled when app is in background and alarm
+ * will be cancelled when app is in foreground.
+ */
+object AutoBatchCloseBackgroundScheduleHelper {
 
-    private final BatchCloseDto mRequest;
-    private final String mProcessId;
+    const val TAG: String = "AutoBatchCloseBackgroundScheduleHelper"
 
-    public BatchCloseTask(FragmentActivity activity, BatchCloseDto request, String processId) {
-        super(activity);
+    private const val PENDING_INTENT_REQUEST_CODE: Int = 1001
 
-        mRequest = request;
-        mProcessId = processId;
-    }
-
-    @Override
-    protected Response<BatchDto> doInBackground(Void... arg0) {
-        return new Response<>(waitForForeground(
-                WebServices.closeBatch(getAuthToken(), mRequest, mProcessId)));
-    }
-}
-
-
-package com.imobile3.pos.data.async;
-
-import androidx.annotation.NonNull;
-import androidx.fragment.app.FragmentActivity;
-
-import com.imobile3.pos.data.module.account.RuntimeConfigHelper;
-import com.imobile3.pos.library.webservices.transferobjects.BaseDto;
-
-import java.util.Map;
-
-public abstract class BaseWebAsyncTask<Params, Progress, Result>
-        extends BaseAsyncTask<Params, Progress, Result> {
-
-    private String mProcessId;
-
-    public BaseWebAsyncTask(FragmentActivity activity) {
-        super(activity);
-    }
-
-    public BaseWebAsyncTask(FragmentActivity activity, String fragmentTag) {
-        super(activity, fragmentTag);
-    }
-
-    /**
-     * Gets the current AuthToken
-     */
-    @NonNull
-    public String getAuthToken() {
-        String authToken = RuntimeConfigHelper.getAuthToken();
-
-        if (authToken == null) {
-            return "";
+    @SuppressLint("UnspecifiedImmutableFlag", "ObsoleteSdkInt")
+    @JvmStatic
+    fun setAutoBatchAlarm(context: Context) {
+        val autoBatchScheduledTime = AutoBatchHelper.getAlarmTriggerTimeInMillis()
+        if (autoBatchScheduledTime <= 0) {
+            return
         }
 
-        return authToken;
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val alarmIntent = Intent(context, AutoBatchAlarmReceiver::class.java)
+        alarmIntent.putExtra(IntentExtras.AUTO_BATCH_CLOSE_TRIGGER, true)
+
+        val pendingIntent = PendingIntent.getBroadcast(context,
+                PENDING_INTENT_REQUEST_CODE, alarmIntent, IntentHelper.getIntentFlagForSApi())
+
+        // API 23 and above required setExactAndAllowWhileIdle to trigger alarm in doze mode.
+        if (Build.VERSION.SDK_INT >= 23) {
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,
+                    autoBatchScheduledTime, pendingIntent)
+        } else if (Build.VERSION.SDK_INT >= 19) {
+            alarmManager.setExact(AlarmManager.RTC_WAKEUP, autoBatchScheduledTime, pendingIntent)
+        }
+
+        if (LogHelper.isEnabled()) {
+            val dateHelper = DateHelper.getInstance(Locale.US)
+            val logTime =
+                dateHelper.format(autoBatchScheduledTime, DateFormat.SHORT, DateFormat.SHORT)
+
+            // Log example: "Auto batch close alarm scheduled for 6/23/24 11:50 PM".
+            LogHelper.write(TAG, "Auto batch close alarm scheduled for $logTime")
+        }
     }
 
-    /**
-     * Pause execution until the app is in the foreground
-     *
-     * @param responseDto the WebService command to process before pausing execution. Once
-     * execution resumes the resulting DTO will be returned.
-     */
-    protected <T extends BaseDto> T waitForForeground(T responseDto) {
-        // save any headers here if needed
-        if (responseDto != null) {
-            setAuthTokenExpiration(responseDto.getHttpHeaders());
-        }
-
-        while (!APP.isInForeground()) {
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                // nothing
-            }
-        }
-        return responseDto;
-    }
-
-    private void setAuthTokenExpiration(Map<String, String> responseHeaders) {
-        if (responseHeaders != null) {
-            RuntimeConfigHelper.setAuthTokenExpiration(
-                    responseHeaders.get("Authorization-Token-Expires"));
-        }
+    @SuppressLint("UnspecifiedImmutableFlag")
+    @JvmStatic
+    fun cancelAutoBatchAlarm(context: Context) {
+        val alarmIntent = Intent(context, AutoBatchAlarmReceiver::class.java)
+        val pendingIntent = PendingIntent.getBroadcast(context,
+                PENDING_INTENT_REQUEST_CODE, alarmIntent, IntentHelper.getIntentFlagForSApi())
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarmManager.cancel(pendingIntent)
     }
 }
