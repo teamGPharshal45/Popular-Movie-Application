@@ -1,70 +1,479 @@
+/*
+ *  Copyright (c) 2025 Global Payments, Inc. All rights reserved.
+ *
+ *  Redistribution and use in source and binary forms, with or without
+ *  modification, is permitted provided that adherence to the following
+ *  conditions is maintained. If you do not agree with these terms,
+ *  please do not use, install, modify or redistribute this software.
+ *
+ *  1. Redistributions of source code must retain the above copyright notice, this
+ *  list of conditions and the following disclaimer.
+ *
+ *  2. Redistributions in binary form must reproduce the above copyright notice,
+ *  this list of conditions and the following disclaimer in the documentation
+ *  and/or other materials provided with the distribution.
+ *
+ *  THIS SOFTWARE IS PROVIDED BY GLOBAL PAYMENTS, INC "AS IS" AND ANY EXPRESS OR
+ *  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ *  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+ *  EVENT SHALL GLOBAL PAYMENTS, INC OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+ *  INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ *  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+ *  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+ *  OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ *  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 package com.imobile3.pos.data.module.batch.close
 
-import android.annotation.SuppressLint
-import android.app.AlarmManager
-import android.app.PendingIntent
+import android.app.Activity
 import android.content.Context
-import android.content.Intent
-import android.os.Build
-import com.imobile3.pos.app.DateHelper
-
-import com.imobile3.pos.app.IntentHelper
-import com.imobile3.pos.app.constants.IntentExtras
+import android.database.Cursor
+import android.os.Handler
+import android.os.Looper
+import com.imobile3.pos.BaseUnitTest
+import com.imobile3.pos.audits.constants.enums.AuditLevel
+import com.imobile3.pos.data.audit.LogEventHelper
+import com.imobile3.pos.data.module.batch.BatchHelper
+import com.imobile3.pos.data.peripherals.terminal.TerminalHelper
+import com.imobile3.pos.library.constants.enums.PaymentTerminalAction
+import com.imobile3.pos.library.database.transaction.accessObjects.TransactionsDao
+import com.imobile3.pos.library.domainobjects.PaymentTerminalError
+import com.imobile3.pos.library.domainobjects.PaymentTerminalResponse
+import com.imobile3.pos.library.domainobjects.TenderAdditionalInfo
+import com.imobile3.pos.library.domainobjects.TxDbBatch
+import com.imobile3.pos.library.domainobjects.TxDbTender
+import com.imobile3.pos.library.interfaces.terminal.iM3Terminal
 import com.imobile3.pos.library.utils.LogHelper
-import java.text.DateFormat
-import java.util.Locale
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Before
+import org.junit.Test
+import org.mockito.MockedStatic
+import org.mockito.Mockito
+import org.mockito.Mockito.mock
+import org.mockito.Mockito.mockStatic
+import org.mockito.kotlin.any
+import org.mockito.kotlin.argThat
+import org.mockito.kotlin.argumentCaptor
+import org.mockito.kotlin.doNothing
+import org.mockito.kotlin.verify
+import org.mockito.kotlin.verifyNoInteractions
+import org.mockito.kotlin.whenever
+import java.math.BigDecimal
+import java.util.Date
 
-/**
- * Helper class to Schedule Alarm manager for auto batch close.
- * Alarm will be scheduled when app is in background and alarm
- * will be cancelled when app is in foreground.
- */
-object AutoBatchCloseBackgroundScheduleHelper {
+class TerminalBatchCloseHelperTest: BaseUnitTest() {
+    private lateinit var activity: Activity
+    private lateinit var context: Context
+    private lateinit var transactionDao: TransactionsDao
+    private lateinit var terminal: iM3Terminal
+    private lateinit var cursor: Cursor
+    private lateinit var handler: Handler
+    private lateinit var callbacks: TerminalBatchCloseHelper.TerminalBatchCloseCallbacks
+    private lateinit var callbacks2: TerminalBatchCloseHelper.TerminalBatchCloseCallbacks
+    private lateinit var batch: TxDbBatch
+    private lateinit var mockLooper: Looper
+    private lateinit var mockTerminalHelper: MockedStatic<TerminalHelper>
+    private lateinit var logHelperMock: MockedStatic<LogHelper>
+    private lateinit var helper: TerminalBatchCloseHelper
+    private lateinit var batchHelperMock: MockedStatic<BatchHelper>
+    private lateinit var logEventHelperMock: MockedStatic<LogEventHelper>
+    private val error_msg = "Terminal not configured"
+    private lateinit var terminalCallbacks: TerminalBatchCloseHelper.TerminalCallbacks
+    private lateinit var terminaltask: TerminalBatchCloseHelper.TerminalBatchCloseTask
 
-    const val TAG: String = "AutoBatchCloseBackgroundScheduleHelper"
-
-    private const val PENDING_INTENT_REQUEST_CODE: Int = 1001
-
-    @SuppressLint("UnspecifiedImmutableFlag", "ObsoleteSdkInt")
-    @JvmStatic
-    fun setAutoBatchAlarm(context: Context) {
-        val autoBatchScheduledTime = AutoBatchHelper.getAlarmTriggerTimeInMillis()
-        if (autoBatchScheduledTime <= 0) {
-            return
+    @Before
+    override fun setUp() {
+        super.setUp()
+        context = getApplication()
+        activity = mock(Activity::class.java)
+        transactionDao = mock(TransactionsDao::class.java)
+        terminal = mock(iM3Terminal::class.java)
+        cursor = mock(Cursor::class.java)
+        handler = mock(Handler::class.java)
+        callbacks = mock(TerminalBatchCloseHelper
+            .TerminalBatchCloseCallbacks::class.java)
+        callbacks2 = mock(TerminalBatchCloseHelper
+            .TerminalBatchCloseCallbacks::class.java)
+        mockLooper = mock(Looper::class.java)
+        mockTerminalHelper = mockStatic(TerminalHelper::class.java)
+        helper = mock(TerminalBatchCloseHelper::class.java,
+            Mockito.CALLS_REAL_METHODS)
+        batchHelperMock = mockStatic(BatchHelper::class.java)
+        logHelperMock = mockStatic(LogHelper::class.java)
+        logEventHelperMock = mockStatic(LogEventHelper::class.java)
+        terminalCallbacks = helper.TerminalCallbacks()
+        terminaltask = helper.TerminalBatchCloseTask(activity)
+        whenever(activity.mainLooper).thenReturn(mockLooper)
+        batch = TxDbBatch().apply {
+            batchNumber = 1001
         }
+        mockTerminalHelper.`when`<iM3Terminal> { TerminalHelper
+            .getTerminal(any(),any()) }
+            .thenReturn(terminal)
 
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val alarmIntent = Intent(context, AutoBatchAlarmReceiver::class.java)
-        alarmIntent.putExtra(IntentExtras.AUTO_BATCH_CLOSE_TRIGGER, true)
+        batchHelperMock.`when`<Long> { BatchHelper.getCurrentBatchNumber() }
+            .thenReturn(10)
+        batchHelperMock.`when`<Int> { BatchHelper.getCurrentLocalBatchNumber() }
+            .thenReturn(20)
 
-        val pendingIntent = PendingIntent.getBroadcast(context,
-                PENDING_INTENT_REQUEST_CODE, alarmIntent, IntentHelper.getIntentFlagForSApi())
+    }
 
-        // API 23 and above required setExactAndAllowWhileIdle to trigger alarm in doze mode.
-        if (Build.VERSION.SDK_INT >= 23) {
-            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,
-                    autoBatchScheduledTime, pendingIntent)
-        } else if (Build.VERSION.SDK_INT >= 19) {
-            alarmManager.setExact(AlarmManager.RTC_WAKEUP, autoBatchScheduledTime, pendingIntent)
-        }
+    @After
+    override fun tearDown() {
+        super.tearDown()
+        mockTerminalHelper.close()
+        TerminalBatchCloseHelper.IS_RUNNING.set(false)
+        TerminalBatchCloseHelper.sCallbacks = null
+        logHelperMock.close()
+        batchHelperMock.close()
+        logEventHelperMock.close()
+    }
 
-        if (LogHelper.isEnabled()) {
-            val dateHelper = DateHelper.getInstance(Locale.US)
-            val logTime =
-                dateHelper.format(autoBatchScheduledTime, DateFormat.SHORT, DateFormat.SHORT)
+    @Test
+    fun `isRunning returns false when not started`() {
+        val result = TerminalBatchCloseHelper.isRunning()
+        assertFalse(result)
+    }
 
-            // Log example: "Auto batch close alarm scheduled for 6/23/24 11:50 PM".
-            LogHelper.write(TAG, "Auto batch close alarm scheduled for $logTime")
+    @Test
+    fun `isRunning returns true when started`() {
+        TerminalBatchCloseHelper.IS_RUNNING.set(true)
+        val result = TerminalBatchCloseHelper.isRunning()
+        assertTrue(result)
+    }
+
+    @Test
+    fun `addCallbacks creates HashSet when first callback is added`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        assertEquals(1, TerminalBatchCloseHelper.sCallbacks?.size)
+        assertTrue(TerminalBatchCloseHelper.sCallbacks?.contains(callbacks) == true)
+    }
+
+    @Test
+    fun `removeCallbacks removes the callback when called`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        assertEquals(1, TerminalBatchCloseHelper.sCallbacks?.size)
+        TerminalBatchCloseHelper.removeCallbacks(callbacks)
+        assertNull(TerminalBatchCloseHelper.sCallbacks)
+
+    }
+
+    @Test
+    fun `cancel marks sIsCancelled as true when called`() {
+        TerminalBatchCloseHelper.cancel()
+        assertTrue(TerminalBatchCloseHelper.sIsCancelled)
+    }
+
+    @Test
+    fun `logEvent writes Log when VerboseLoggingEnabled`() {
+        val message = "Test log message"
+
+        helper.logEvent(message)
+        logHelperMock.verify {
+            LogHelper.write(
+                "TerminalBatchCloseHelper",
+                message
+            )
         }
     }
 
-    @SuppressLint("UnspecifiedImmutableFlag")
-    @JvmStatic
-    fun cancelAutoBatchAlarm(context: Context) {
-        val alarmIntent = Intent(context, AutoBatchAlarmReceiver::class.java)
-        val pendingIntent = PendingIntent.getBroadcast(context,
-                PENDING_INTENT_REQUEST_CODE, alarmIntent, IntentHelper.getIntentFlagForSApi())
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        alarmManager.cancel(pendingIntent)
+    @Test
+    fun `auditEvent should save and audit event with BatchNumbers`() {
+
+        val message = "Test audit message"
+        helper.auditEvent(message)
+        logEventHelperMock.verify {
+            LogEventHelper.saveEvent(
+                AuditLevel.Debug,
+                "TerminalBatchCloseHelper",
+                "Test audit message (Batch number: 10 / 20)"
+            )
+        }
+
+    }
+    
+    @Test
+    fun `auditSafTenderProcessing logs full Audit Message`() {
+        val cursor = mock(Cursor::class.java)
+        helper.mTenderCursor = cursor
+        val additionalInfo = mock(TenderAdditionalInfo::class.java)
+
+        whenever(additionalInfo.terminalTenderSafId).thenReturn("SAF123")
+        whenever(additionalInfo.terminalTenderId).thenReturn("TID456")
+
+        val tender = mock(TxDbTender::class.java)
+        whenever(tender.tenderNumber).thenReturn(100)
+        whenever(tender.totalAmount).thenReturn(BigDecimal("5000"))
+        whenever(tender.redactedInfo).thenReturn("XXXX")
+        whenever(tender.additionalInfo).thenReturn(additionalInfo)
+
+        val response = mock(PaymentTerminalResponse::class.java)
+        whenever(response.approvedAmount).thenReturn("5000")
+        whenever(response.redactedInfo).thenReturn("RESP_XXXX")
+        whenever(response.gatewayCardToken).thenReturn("TOKEN")
+        whenever(response.gatewayAuthCode).thenReturn("AUTH123")
+        whenever(response.gatewayAuthDateTime)
+            .thenReturn(Date(2025,12,29,10,0))
+
+
+        val description = "Test SAF processing"
+        helper.auditSafTenderProcessing(description,tender,response)
+
+        verify(helper).auditEvent(argThat { message ->
+            message.contains("TerminalBatchCloseHelper -> Test SAF processing") &&
+                    message.contains("TenderNumber 100") &&
+                    message.contains("Tender TotalAmount 5000") &&
+                    message.contains("TerminalTenderSafId SAF123") &&
+                    message.contains("Response GatewayCardToken TOKEN") &&
+                    message.contains("Response GatewayAuthCode AUTH123")
+        })
+    }
+        
+    @Test
+    fun `callbackSafUploadInProgress posts and notify callbacks`() {
+        helper.mHandler = handler
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        helper.mCompletedCount = 2
+        helper.mTotalCount = 3
+
+        val runCaptor = argumentCaptor<Runnable>()
+
+        helper.callbackSafUploadInProgress()
+        verify(handler).post(runCaptor.capture())
+
+        runCaptor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnSafUploadInProgress(2,3)
+    }
+
+    @Test
+    fun `callbackSafUploadInProgress does nothing when no callbacks added`() {
+        helper.mHandler = handler
+        TerminalBatchCloseHelper.removeCallbacks(callbacks)
+        helper.mCompletedCount = 2
+        helper.mTotalCount = 3
+
+        val runCaptor = argumentCaptor<Runnable>()
+
+        helper.callbackSafUploadInProgress()
+        verify(handler).post(runCaptor.capture())
+
+        runCaptor.firstValue.run()
+        verifyNoInteractions(callbacks)
+    }
+
+    @Test
+    fun `callbackSafUploadComplete notify all callbacks with count when called`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        TerminalBatchCloseHelper.addCallbacks(callbacks2)
+        helper.mHandler = handler
+        helper.mCompletedCount = 4
+        helper.mTotalCount = 6
+
+        val captor = argumentCaptor<Runnable>()
+        helper.callbackSafUploadComplete()
+        verify(handler).post(captor.capture())
+
+        captor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnSafUploadComplete(4,6)
+        verify(callbacks).TerminalBatchCloseOnSafUploadComplete(4,6)
+    }
+
+    @Test
+    fun `callbackSafUploadComplete does nothing when no callback present`() {
+        TerminalBatchCloseHelper.removeCallbacks(callbacks)
+        TerminalBatchCloseHelper.removeCallbacks(callbacks2)
+        helper.mHandler = handler
+        val captor = argumentCaptor<Runnable>()
+        helper.callbackSafUploadComplete()
+        verify(handler).post(captor.capture())
+        captor.firstValue.run()
+        verifyNoInteractions(callbacks)
+    }
+
+    @Test
+    fun `callbackSafTendersNotFound notify all callbacks`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        TerminalBatchCloseHelper.addCallbacks(callbacks2)
+        helper.mHandler = handler
+        helper.callbackSafTendersNotFound()
+        val captor = argumentCaptor<Runnable>()
+        verify(handler).post(captor.capture())
+        captor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnSafTendersNotFound()
+        verify(callbacks2).TerminalBatchCloseOnSafTendersNotFound()
+
+    }
+
+    @Test
+    fun `callbackBatchCloseInProgress notify all callbacks when called`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        TerminalBatchCloseHelper.addCallbacks(callbacks2)
+        helper.mHandler = handler
+        helper.callbackBatchCloseInProgress()
+        val captor = argumentCaptor<Runnable>()
+        verify(handler).post(captor.capture())
+        captor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnInProgress()
+        verify(callbacks2).TerminalBatchCloseOnInProgress()
+    }
+
+    @Test
+    fun `callbackOnComplete notify all callbacks when called`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        TerminalBatchCloseHelper.addCallbacks(callbacks2)
+        helper.mHandler = handler
+        helper.callbackOnComplete()
+        val captor = argumentCaptor<Runnable>()
+        verify(handler).post(captor.capture())
+        captor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnComplete()
+        verify(callbacks2).TerminalBatchCloseOnComplete()
+    }
+
+    @Test
+    fun `callbackOnCancelled notify all callbacks when called`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        TerminalBatchCloseHelper.addCallbacks(callbacks2)
+        helper.mHandler = handler
+        helper.callbackOnCancelled()
+        val captor = argumentCaptor<Runnable>()
+        verify(handler).post(captor.capture())
+        captor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnCancelled()
+        verify(callbacks2).TerminalBatchCloseOnCancelled()
+    }
+
+    @Test
+    fun `callbackOnError notify all callbacks when called`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        TerminalBatchCloseHelper.addCallbacks(callbacks2)
+        helper.mHandler = handler
+        helper.callbackOnError()
+        val captor = argumentCaptor<Runnable>()
+        verify(handler).post(captor.capture())
+        captor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnError()
+        verify(callbacks2).TerminalBatchCloseOnError()
+    }
+
+    @Test
+    fun `callbackOnBusy notify all callbacks when called`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        TerminalBatchCloseHelper.addCallbacks(callbacks2)
+        helper.mHandler = handler
+        helper.callbackOnBusy()
+        val captor = argumentCaptor<Runnable>()
+        verify(handler).post(captor.capture())
+        captor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnBusy()
+        verify(callbacks2).TerminalBatchCloseOnBusy()
+    }
+
+    @Test
+    fun `callbackTerminalConfigurationError notify all callbacks with error msg when called`() {
+        TerminalBatchCloseHelper.addCallbacks(callbacks)
+        TerminalBatchCloseHelper.addCallbacks(callbacks2)
+        helper.mHandler = handler
+        helper.callbackTerminalConfigurationError(error_msg)
+        val captor = argumentCaptor<Runnable>()
+        verify(handler).post(captor.capture())
+        captor.firstValue.run()
+        verify(callbacks).TerminalBatchCloseOnTerminalConfigurationError(error_msg)
+        verify(callbacks2).TerminalBatchCloseOnTerminalConfigurationError(error_msg)
+    }
+
+    @Test
+    fun `UploadSafTenders response sets payment response and clears wait when called`() {
+        val response = mock(PaymentTerminalResponse::class.java)
+        whenever(response.action)
+            .thenReturn(PaymentTerminalAction.UploadSafTenders)
+        helper.mWaitingForTerminalResponse = true
+
+        terminalCallbacks.iM3TerminalOnResponse(response)
+        assertEquals(response,helper.mPaymentTerminalResponse)
+        assertFalse(helper.mWaitingForTerminalResponse)
+    }
+
+    @Test
+    fun `GetSafTender response sets payment response`() {
+        val response = mock(PaymentTerminalResponse::class.java)
+        whenever(response.action)
+            .thenReturn(PaymentTerminalAction.GetSafTender)
+        terminalCallbacks.iM3TerminalOnResponse(response)
+        assertEquals(response,helper.mPaymentTerminalResponse)
+        assertFalse(helper.mWaitingForTerminalResponse)
+    }
+
+    @Test
+    fun `CloseBatch response sets batch close success`() {
+        val response = mock(PaymentTerminalResponse::class.java)
+        whenever(response.action).thenReturn(PaymentTerminalAction.CloseBatch)
+        whenever(response.isTerminalBatchEmpty).thenReturn(true)
+        helper.mBatchCloseSuccess = false
+        helper.mWaitingForTerminalResponse = true
+        terminalCallbacks.iM3TerminalOnResponse(response)
+        assertTrue(helper.mBatchCloseSuccess)
+        assertFalse(helper.mWaitingForTerminalResponse)
+    }
+
+    @Test
+    fun `ClearBatch response also sets batch close success`() {
+        val response = mock(PaymentTerminalResponse::class.java)
+        whenever(response.action).thenReturn(PaymentTerminalAction.ClearBatch)
+        whenever(response.isTerminalBatchEmpty).thenReturn(true)
+        terminalCallbacks.iM3TerminalOnResponse(response)
+        assertTrue(helper.mBatchCloseSuccess)
+    }
+
+    @Test
+    fun `Terminal error sets error flags and clear wait`() {
+        val error = mock(PaymentTerminalError::class.java)
+        whenever(error.friendlyMessage).thenReturn("Error")
+        whenever(error.detailedMessage).thenReturn("Details")
+        helper.mWaitingForTerminalResponse = true
+        terminalCallbacks.iM3TerminalOnError(error)
+
+        assertTrue(helper.mHasError)
+        assertFalse(helper.mBatchCloseSuccess)
+        assertFalse(helper.mWaitingForTerminalResponse)
+        assertFalse(helper.mReceivedSafNotFoundResponseForBatchAction)
+    }
+
+    @Test
+    fun `wasClearBatchSafTenderNotFound returns correct flag when called`() {
+        terminaltask.mWasClearBatchSafTenderNotFound = true
+        assertTrue(terminaltask.wasClearBatchSafTenderNotFound())
+
+        terminaltask.mWasClearBatchSafTenderNotFound = false
+        assertFalse(terminaltask.wasClearBatchSafTenderNotFound())
+    }
+
+    @Test
+    fun `handleSafUploadResponse triggers error when response is null`() {
+        doNothing().whenever(helper).callbackOnError()
+        terminaltask.handleSafUploadResponse(null)
+        verify(helper).callbackOnError()
+    }
+
+    @Test
+    fun `handleSafUploadResponse sets flag when saf not found`() {
+        val response = mock(PaymentTerminalResponse::class.java)
+        whenever(response.isSafTenderNotFound).thenReturn(true)
+
+        helper.mTotalCount = 0
+        helper.mHasError = false
+
+        doNothing().whenever(helper).callbackSafUploadComplete()
+        doNothing().whenever(terminaltask).closeBatch()
+        terminaltask.handleSafUploadResponse(response)
+
+        assertFalse(helper.mReceivedSafNotFoundResponseForBatchAction)
     }
 }
+
