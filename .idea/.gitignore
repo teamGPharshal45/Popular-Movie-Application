@@ -1,1175 +1,250 @@
-package com.imobile3.pos.data.module.batch.close;
+package com.imobile3.pos.data.module.batch.report
 
-import android.app.Activity;
-import android.database.Cursor;
-import android.os.AsyncTask;
-import android.os.Handler;
-import android.text.TextUtils;
+import android.database.Cursor
+import android.util.SparseArray
+import androidx.annotation.VisibleForTesting
+import androidx.annotation.WorkerThread
+import com.imobile3.pos.data.module.batch.BatchManager
+import com.imobile3.pos.data.module.order.cart.tender.TenderManager
+import com.imobile3.pos.data.module.order.cart.transaction.TransactionRepository
+import com.imobile3.pos.library.constants.enums.CvmResult
+import com.imobile3.pos.library.database.extensions.map
+import com.imobile3.pos.library.domainobjects.BatchReport
+import com.imobile3.pos.library.domainobjects.TxDbTender
+import com.imobile3.pos.library.domainobjects.TxDbTransaction
+import com.imobile3.pos.library.utils.LogHelper
+import com.imobile3.pos.library.webservices.enums.PaymentType
+import com.imobile3.pos.library.webservices.enums.TenderCreditStatusType
+import com.imobile3.pos.library.webservices.enums.TenderStatusType
+import com.imobile3.pos.library.webservices.enums.TenderType
+import com.imobile3.pos.library.webservices.enums.TransactionStatusType
+import com.imobile3.pos.library.webservices.transferobjects.BatchDepositDto
+import com.imobile3.pos.library.webservices.transferobjects.CustomTenderFieldsDto
+import java.math.BigDecimal
+import java.util.logging.Level
+import javax.inject.Inject
 
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
-import androidx.annotation.StringRes;
+open class GetBatchSummaryListWithReportsUseCase @Inject constructor(
+    private val transactionRepository: TransactionRepository,
+    private val batchManager: BatchManager,
+    private val tenderManager: TenderManager
+) {
 
-import com.imobile3.pos.R;
-import com.imobile3.pos.audits.constants.enums.AuditEvent;
-import com.imobile3.pos.audits.constants.enums.AuditLevel;
-import com.imobile3.pos.audits.utils.AuditHelper;
-import com.imobile3.pos.data.async.BaseAsyncUtilHelper;
-import com.imobile3.pos.data.audit.FinancialAuditHelper;
-import com.imobile3.pos.data.audit.LogEventHelper;
-import com.imobile3.pos.data.flavor.FlavorHelper;
-import com.imobile3.pos.data.module.batch.BatchHelper;
-import com.imobile3.pos.data.module.account.RuntimeConfigHelper;
-import com.imobile3.pos.data.module.account.repository.UserHelper;
-import com.imobile3.pos.data.peripherals.terminal.TerminalHelper;
-import com.imobile3.pos.data.peripherals.terminal.TerminalHelperCallbacks;
-import com.imobile3.pos.library.constants.enums.PaymentTerminalAction;
-import com.imobile3.pos.library.constants.enums.TenderRecordStatus;
-import com.imobile3.pos.library.constants.enums.TransactionRecordStatus;
-import com.imobile3.pos.library.database.transaction.accessObjects.TransactionsDao;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalError;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalRequest;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalResponse;
-import com.imobile3.pos.library.domainobjects.TenderAdditionalInfo;
-import com.imobile3.pos.library.domainobjects.TxDbBatch;
-import com.imobile3.pos.library.domainobjects.TxDbTender;
-import com.imobile3.pos.library.interfaces.terminal.iM3Terminal;
-import com.imobile3.pos.library.utils.LogHelper;
-import com.imobile3.pos.library.webservices.enums.TenderCreditStatusType;
-import com.imobile3.pos.ui.ResourceHelper;
-
-import java.lang.ref.WeakReference;
-import java.util.Date;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.logging.Level;
-
-public class TerminalBatchCloseHelper extends BaseAsyncUtilHelper {
-
-    private static final String TAG = "TerminalBatchCloseHelper";
-
-    private static final boolean VERBOSE_LOGGING = true;
-
-    private static final AtomicBoolean IS_RUNNING = new AtomicBoolean(false);
-
-    private TxDbBatch mBatch;
-    private int mCompletedCount, mTotalCount;
-    private boolean mWaitingForTerminalResponse, mBatchCloseSuccess, mHasError;
-    private PaymentTerminalResponse mPaymentTerminalResponse;
+    @WorkerThread
+    open fun execute(tag: String, batchNumbers: List<Long>): List<BatchSummaryResponse> =
+        batchNumbers.map { batchNumber ->
+            BatchSummaryResponse().apply {
+                this.batchNumber = batchNumber
+                this.batchReport = getBatchReport(tag, batchNumber)
+            }
+        }
 
     /**
-     * Keep track of whether the UploadSafTenders response returned 'NOT FOUND'
+     * @throws Exception if an error occurs while generating the batch report.
+     * The exact cause of the exception occurring in Production is unknown at
+     * this time, but we suspect it is related to a backwards-incompatibility
+     * issue with the [CvmResult] stored in our local database, from a previous
+     * version of the POS app.
      */
-    private boolean mReceivedSafNotFoundResponseForBatchAction;
+    @VisibleForTesting
+    fun getBatchReport(tag: String, batchNumber: Long): BatchReport {
+        val report = BatchReport()
+        var cursor: Cursor? = null
 
-    private TransactionsDao mTransactionsDao;
-    private Cursor mTenderCursor;
-    private Handler mHandler;
+        try {
+            cursor = transactionRepository.getTransactionsFromBatchNumber(batchNumber)
 
-    private static boolean sIsCancelled;
+            cursor?.map {
+                val transaction: TxDbTransaction =
+                    transactionRepository.getTransactionFromCursor(it)
+                val status: TransactionStatusType? = transaction.transactionStatusType
 
-    private iM3Terminal mTerminal;
+                if (!(status == TransactionStatusType.Cancelled
+                            || status == TransactionStatusType.Pending)
+                ) {
+                    generateDeposits(
+                        tag, transactionRepository.getTendersByTransactionNumber(
+                            transaction.transactionNumber
+                        ), report
+                    )
+                    generateUserTipTotal(transaction, report)
+                }
+            }
 
-    @Nullable
-    private static Set<TerminalBatchCloseCallbacks> sCallbacks;
+            removeZeroTotalDeposits(report)
+        } catch (e: Exception) {
+            LogHelper.write(
+                Level.SEVERE, tag,
+                "getBatchReport() -> Exception thrown while generating batch report" +
+                        " for Batch Number $batchNumber -> Re-throwing exception: ${e.message}"
+            )
 
-    public interface TerminalBatchCloseCallbacks {
-        void TerminalBatchCloseOnSafUploadInProgress(int current, int totalCount);
+            // We want the BaseViewModel.launchDataLoad function to catch this exception,
+            // and then execute the 'doOnThrowable' pathway, which will allow our ViewModel
+            // to save the Exception to our Azure Service Bus and emit a UI error event.
+            throw e
+        } finally {
+            cursor?.let {
+                if (!it.isClosed) it.close()
+            }
+        }
 
-        void TerminalBatchCloseOnSafUploadComplete(int current, int totalCount);
-
-        void TerminalBatchCloseOnSafTendersNotFound();
-
-        void TerminalBatchCloseOnInProgress();
-
-        void TerminalBatchCloseOnComplete();
-
-        void TerminalBatchCloseOnCancelled();
-
-        void TerminalBatchCloseOnBusy();
-
-        void TerminalBatchCloseOnTerminalConfigurationError(String message);
-
-        void TerminalBatchCloseOnError();
+        return report
     }
 
     /**
-     * Starts the SAF update & batch close task on the terminal
+     * Removes all [BatchDepositDto] from [report] with TotalAmount zero
+     */
+    @VisibleForTesting
+    fun removeZeroTotalDeposits(report: BatchReport) {
+        // Report.Deposits is initialized to an empty list in the constructor.
+        val deposits: List<BatchDepositDto> =
+            report.deposits.filter { deposit -> deposit.totalAmount.signum() != 0 }
+
+        report.deposits = deposits
+    }
+
+    @VisibleForTesting
+    fun generateDeposits(tag: String, tenders: List<TxDbTender>?, report: BatchReport) {
+        if (tenders == null) {
+            LogHelper.writeWithTrace(Level.WARNING, tag, "Tenders argument is null")
+            return
+        }
+
+        tenders.forEach { tender ->
+            val status: TenderStatusType? = tender.tenderStatusType
+            val type: TenderType? = tender.tenderType
+
+            if (!TenderManager.isTenderStatusTypeValid(status)) {
+                return@forEach
+            }
+
+            // Don't include non authorized tenders that were removed prior to completion of the
+            // transaction
+            if (tenderManager.isNonAuthTender(tender) && TenderManager.isCancelled(tender)) {
+                return@forEach
+            }
+
+            // Don't include voided non authorised tenders like Cash, Checks in calculations
+            if (tenderManager.isNonAuthTender(tender) && TenderManager.isVoided(tender)) {
+                return@forEach
+            }
+
+            // Don't include tenders that failed to void
+            if (TenderManager.isFailedToVoid(tender)) {
+                return@forEach
+            }
+
+            // Update Initial Tip Adjust Tender Count
+            if (shouldUpdateTenderCount(type, status, tender)) {
+                report.tipAdjustTenderCount = report.tipAdjustTenderCount + 1
+            }
+
+            getCustomTenderDeposits(report, tender, tag)
+        }
+    }
+
+    @VisibleForTesting
+    fun shouldUpdateTenderCount(
+        type: TenderType?,
+        status: TenderStatusType?,
+        tender: TxDbTender,
+    ): Boolean {
+        return (type == TenderType.Normal || type == TenderType.Split)
+                && (status == TenderStatusType.Completed ||
+                status == TenderStatusType.RefundedItems)
+                && tender.paymentType == PaymentType.CreditCard
+                && tender.tenderCreditStatusType == TenderCreditStatusType.Authorized
+                && tender.cvmResult != CvmResult.PinOnline
+                && tender.cvmResult != CvmResult.PinOfflinePlain
+                && tender.cvmResult != CvmResult.PinOfflineEncr
+                && tender.cvmResult != null
+    }
+
+    /**
+     * Create/Update Deposit
      *
-     * @param activity context required for terminal initialization
-     * @param batch batch to use for SAF tender search
-     * @param callbacks optional callbacks
+     * MULTIPLE Custom Tender Batch Deposits will be created to keep track of the specific
+     * custom tender details
      */
-    public TerminalBatchCloseHelper(Activity activity, TxDbBatch batch,
-            TerminalBatchCloseCallbacks callbacks) {
-        if (activity == null
-                || batch == null
-                || batch.getBatchNumber() <= 0) {
-            throw new IllegalArgumentException("invalid context and/or batch");
+    @VisibleForTesting
+     fun getCustomTenderDeposits(
+        report: BatchReport,
+        tender: TxDbTender,
+        tag: String
+    ) {
+        var depositToAdjust: BatchDepositDto? = null
+        var addDeposit = true
+
+        for (deposit in report.deposits) {
+            if (deposit.paymentType == tender.paymentType) {
+                // Custom Tenders
+                if (deposit.paymentType == PaymentType.CustomTender) {
+                    val depositFields: CustomTenderFieldsDto? =
+                        batchManager.getCustomTenderFieldsDto(deposit)
+                    val tenderFields: CustomTenderFieldsDto? = tender.customFields
+                    if (depositFields?.customTenderId == tenderFields?.customTenderId) {
+                        depositToAdjust = deposit
+                        addDeposit = false
+                        break
+                    }
+                } else {
+                    depositToAdjust = deposit
+                    addDeposit = false
+                    break
+                }
+            }
         }
 
-        mHandler = new Handler(activity.getMainLooper());
-
-        if (IS_RUNNING.compareAndSet(false, true)) {
-            mBatch = batch;
-            addCallbacks(callbacks);
-
-            mTransactionsDao = new TransactionsDao(getAPP());
-            mTerminal = TerminalHelper.getTerminal(activity, new TerminalCallbacks());
-
-            if (mTerminal == null) {
-                logEvent("No terminal configured, shutting down");
-                callbackTerminalConfigurationError(
-                        getString(R.string.payment_method_dialog_terminal_notconfigured));
-                IS_RUNNING.set(false);
-                return;
-            } else if (TerminalHelper.isSetupRequired() && !mTerminal.isTerminalSetupComplete()) {
-                logEvent("Terminal not setup, shutting down");
-                callbackTerminalConfigurationError(
-                        getString(R.string.payment_method_dialog_terminal_notsetup));
-                IS_RUNNING.set(false);
-                return;
+        if (depositToAdjust == null) {
+            depositToAdjust = BatchDepositDto().apply {
+                paymentType = tender.paymentType
+                orderAmount = BigDecimal.ZERO
+                tipAmount = BigDecimal.ZERO
+                changeAmount = BigDecimal.ZERO
+                totalAmount = BigDecimal.ZERO // Expected
+                amountReceived = BigDecimal.ZERO
+                depositAmount = BigDecimal.ZERO // Actual
+                overShortAmount = BigDecimal.ZERO // Difference (Actual - Expected)
             }
+        }
 
-            new TerminalBatchCloseTask(activity).executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        depositToAdjust.apply {
+            orderAmount += tender.orderAmount ?: BigDecimal.ZERO
+            tipAmount += tender.tipAmount ?: BigDecimal.ZERO
+            changeAmount += tender.changeAmount ?: BigDecimal.ZERO
+            totalAmount += tender.totalAmount ?: BigDecimal.ZERO
+            amountReceived += tender.amountReceived ?: BigDecimal.ZERO
+            tender.customFields?.let {
+                customTenderFields = it.toJson()
+            }
+        }
+
+        if (addDeposit) {
+            LogHelper.writeWithTrace(
+                Level.FINE, tag,
+                "Adding deposit to Batch Report: $depositToAdjust"
+            )
+            report.addDeposit(depositToAdjust)
+        }
+    }
+
+    @VisibleForTesting
+    fun generateUserTipTotal(transaction: TxDbTransaction, report: BatchReport) {
+        // Report.UserTipTotalMap is initialized to an empty SparseArray in the constructor.
+        val userTipTotalMap: SparseArray<BigDecimal?> = report.userTipTotalMap
+        val userId = transaction.userId
+
+        val tipTotal = transaction.totalTips ?: BigDecimal.ZERO
+
+        if (userTipTotalMap[userId] == null) {
+            // New Entry
+            userTipTotalMap.put(userId, tipTotal)
         } else {
-            logEvent("Already running, ignoring request");
-            callbackOnBusy();
-        }
-    }
-
-    public static boolean isRunning() {
-        return IS_RUNNING.get();
-    }
-
-    public static void addCallbacks(@NonNull TerminalBatchCloseCallbacks callbacks) {
-        if (sCallbacks == null) {
-            sCallbacks = new HashSet<>();
-        }
-        sCallbacks.add(callbacks);
-    }
-
-    public static void removeCallbacks(@Nullable TerminalBatchCloseCallbacks callbacks) {
-        if (sCallbacks == null || callbacks == null) {
-            return;
-        }
-        sCallbacks.remove(callbacks);
-        if (sCallbacks.isEmpty()) {
-            sCallbacks = null;
-        }
-    }
-
-    public static void cancel() {
-        sIsCancelled = true;
-    }
-
-    private class TerminalBatchCloseTask extends AsyncTask<Void, Void, Void> {
-
-        @NonNull
-        private final WeakReference<Activity> mActivityReference;
-
-        private TerminalBatchCloseTask(@NonNull Activity activity) {
-            mActivityReference = new WeakReference<>(activity);
+            // Existing Entry : Add previous value to new value
+            userTipTotalMap.put(userId, userTipTotalMap[userId]?.add(tipTotal))
         }
 
-        @Override
-        protected void onPreExecute() {
-            super.onPreExecute();
-            sIsCancelled = false;
-            logEvent("BEGIN TASK");
-        }
-
-        @Override
-        protected Void doInBackground(Void... voids) {
-            mTenderCursor = mTransactionsDao.getStoreAndForwardTenders(mBatch.getBatchNumber());
-
-            mTotalCount = mTenderCursor.getCount();
-            if (mTotalCount > 0) {
-                auditEvent("SAF tenders in local batch, instructing terminal to upload");
-                callbackSafUploadInProgress();
-                uploadSafTenders();
-            } else {
-                auditEvent("No SAF tenders in local batch");
-                callbackSafTendersNotFound();
-                closeBatch();
-            }
-
-            mTenderCursor.close();
-
-            return null;
-        }
-
-        @Override
-        protected void onPostExecute(Void args) {
-            super.onPostExecute(args);
-            IS_RUNNING.set(false);
-            logEvent("END TASK");
-        }
-
-        private void uploadSafTenders() {
-            mPaymentTerminalResponse = null;
-            mWaitingForTerminalResponse = true;
-            mReceivedSafNotFoundResponseForBatchAction = false;
-            mTerminal.sendRequest(
-                    new PaymentTerminalRequest(PaymentTerminalAction.UploadSafTenders,
-                            RuntimeConfigHelper.isDemoMode()));
-
-            while (mWaitingForTerminalResponse) {
-                pause(500);
-            }
-
-            handleSafUploadResponse(mPaymentTerminalResponse);
-        }
-
-        private void handleSafUploadResponse(PaymentTerminalResponse response) {
-            if (response == null) {
-                auditEvent("Error with terminal SAF upload");
-                callbackOnError();
-            } else if (response.isSafTenderNotFound()) {
-                auditEvent("No SAF tenders found on terminal");
-                mReceivedSafNotFoundResponseForBatchAction = true;
-                if (sIsCancelled) {
-                    callbackOnCancelled();
-                } else {
-                    if (mHasError) {
-                        callbackOnError();
-                    } else {
-                        if (mTotalCount > 0) {
-                            // still need to update our local SAF tender records
-                            updateRemainingTenders();
-                        } else {
-                            callbackSafUploadComplete();
-                            closeBatch();
-                        }
-                    }
-                }
-            } else {
-                updateRemainingTenders();
-            }
-        }
-
-        private void updateRemainingTenders() {
-            LogHelper.invoked(Level.FINE, TAG);
-            outerloop:
-            do {
-                // "refresh" cursor after each full pass to take tender modifications into account
-                mTenderCursor.close();
-                mTenderCursor = mTransactionsDao.getStoreAndForwardTenders(mBatch.getBatchNumber());
-                if (!mTenderCursor.moveToFirst()) {
-                    LogHelper.write(TAG, "Cursor empty, breaking outer loop");
-                    break;
-                }
-                do {
-                    if (sIsCancelled) {
-                        LogHelper.write(TAG, "Cancelled, breaking outer loop");
-                        break outerloop;
-                    }
-
-                    TxDbTender tender = mTransactionsDao.getTxDbTenderFromCursor(mTenderCursor);
-                    String tenderSafId = tender.getAdditionalInfo().getTerminalTenderSafId();
-
-                    auditSafTenderProcessing("Getting SAF tender info from terminal",
-                            tender, null);
-
-                    mPaymentTerminalResponse = null;
-                    mWaitingForTerminalResponse = true;
-                    mTerminal.sendRequest(
-                            new PaymentTerminalRequest(PaymentTerminalAction.GetSafTender,
-                                    RuntimeConfigHelper.isDemoMode())
-                                    .setCustomData(FlavorHelper.getCustomTerminalRequestData())
-                                    .setTerminalTenderSafId(tenderSafId));
-
-                    while (mWaitingForTerminalResponse) {
-                        pause(500);
-                    }
-
-                    handleTenderResponse(tender, mPaymentTerminalResponse);
-
-                    callbackSafUploadInProgress();
-                } while (mTenderCursor.moveToNext());
-            } while (mCompletedCount < mTotalCount);
-
-            mTenderCursor.close();
-
-            if (sIsCancelled) {
-                callbackOnCancelled();
-            } else {
-                if (mHasError) {
-                    callbackOnError();
-                } else {
-                    callbackSafUploadComplete();
-                    closeBatch();
-                }
-            }
-        }
-
-        // Keep track of whether the UploadSafTenders response returned 'NOT FOUND'
-        private boolean mWasClearBatchSafTenderNotFound;
-
-        private boolean wasClearBatchSafTenderNotFound() {
-            return mWasClearBatchSafTenderNotFound;
-        }
-
-        private void handleTenderResponse(TxDbTender tender, PaymentTerminalResponse response) {
-            if (response == null) {
-                auditSafTenderProcessing("No SAF tender info returned from terminal",
-                        tender, response);
-            } else if (response.isSafTenderUploaded()) {
-                if (response.isSafTenderDeclined()) {
-                    FinancialAuditHelper.cardTokenState(
-                            "TerminalBatchCloseHelper -> SAF tender DECLINED",
-                            tender.getTenderNumber(),
-                            response.getApprovedAmount(),
-                            response.getRedactedInfo(),
-                            response.getGatewayCardToken()
-                    );
-
-                    TenderCreditStatusType tenderCreditStatusType = TenderCreditStatusType.Declined;
-                    if (!TextUtils.isEmpty(response.getGatewayCardToken())) {
-                        tenderCreditStatusType = TenderCreditStatusType.DeclinedRetry;
-                    }
-                    auditSafTenderProcessing(
-                            "SAF tender DECLINED, setting TenderCreditStatusType to " +
-                                    tenderCreditStatusType, tender, response);
-                    mTransactionsDao.updateTender(tender.getTransactionNumber(),
-                            tender.getTenderNumber(), TenderRecordStatus.Finalized,
-                            tenderCreditStatusType, response.getGatewayAuthCode(),
-                            getUpdatedAdditionalInfo(tender, response), new Date());
-                } else {
-                    FinancialAuditHelper.cardTokenState(
-                            "TerminalBatchCloseHelper -> SAF tender APPROVED",
-                            tender.getTenderNumber(),
-                            response.getApprovedAmount(),
-                            response.getRedactedInfo(),
-                            response.getGatewayCardToken()
-                    );
-
-                    auditSafTenderProcessing("SAF tender APPROVED", tender, response);
-                    mTransactionsDao.updateTender(tender.getTransactionNumber(),
-                            tender.getTenderNumber(), TenderRecordStatus.Finalized,
-                            TenderCreditStatusType.Completed, response.getGatewayAuthCode(),
-                            getUpdatedAdditionalInfo(tender, response), new Date());
-                }
-                mTransactionsDao.updateTransaction(tender.getTransactionNumber(),
-                        new Date(), UserHelper.getUserId(), TransactionRecordStatus.ReadyToUpload);
-            } else if (response.isSafTenderNotFound() ||
-                    hasReceivedSafNotFoundResponseForBatchAction()) {
-                // some terminals remove SAF tenders when voided/refunded, so mark as complete
-                auditSafTenderProcessing(
-                        "SAF tender not found on terminal (offline void), setting TenderCreditStatusType to Completed",
-                        tender, response);
-                mTransactionsDao.updateTender(tender.getTransactionNumber(),
-                        tender.getTenderNumber(), TenderRecordStatus.Finalized,
-                        TenderCreditStatusType.Completed, response.getGatewayAuthCode(),
-                        tender.getAdditionalInfo(), new Date());
-                mTransactionsDao.updateTransaction(tender.getTransactionNumber(),
-                        new Date(), UserHelper.getUserId(), TransactionRecordStatus.ReadyToUpload);
-            } else {
-                // not uploaded yet
-                auditSafTenderProcessing("SAF tender not uploaded yet", tender, response);
-                return;
-            }
-
-            mCompletedCount++;
-        }
-
-        /**
-         * We received a 'Not Found' response for either Batch Close or Batch Clear, so when we do
-         * LOCAL DETAIL REPORTS, the tenders may be approved, or uploaded, or not uploaded, or not
-         * found.
-         */
-        private boolean hasReceivedSafNotFoundResponseForBatchAction() {
-            return mReceivedSafNotFoundResponseForBatchAction;
-        }
-
-        private TenderAdditionalInfo getUpdatedAdditionalInfo(TxDbTender tender,
-                PaymentTerminalResponse response) {
-            TenderAdditionalInfo additionalInfo = tender.getAdditionalInfo();
-            if (response.getGatewayIdentifier() != null) {
-                additionalInfo.setGatewayIdentifier(response.getGatewayIdentifier());
-            }
-            if (response.getGatewayGroupIdentifier() != null) {
-                additionalInfo.setGatewayGroupIdentifier(response.getGatewayGroupIdentifier());
-            }
-            if (response.getGatewayAuthDateTime() != null) {
-                additionalInfo.setGatewayAuthDateTime(response.getGatewayAuthDateTime());
-            }
-            if (response.getGatewayAuthResponse() != null) {
-                additionalInfo.setGatewayAuthResponse(response.getGatewayAuthResponse());
-            }
-            if (response.getGatewayCardToken() != null) {
-                additionalInfo.setGatewayCardToken(response.getGatewayCardToken());
-            }
-            additionalInfo.setSwiperType(response.getSwiperType());
-
-            return additionalInfo;
-        }
-
-        private void closeBatch() {
-            Activity activity = mActivityReference.get();
-            if (activity == null) {
-                mBatchCloseSuccess = false;
-                callbackOnError();
-                return;
-            }
-
-            PaymentTerminalAction action = PaymentTerminalAction.CloseBatch;
-
-            // for scholastic just clear the terminal batch, don't close it
-            if (FlavorHelper.isScholastic()) {
-                action = PaymentTerminalAction.ClearBatch;
-            }
-
-            String userId = String.valueOf(UserHelper.getUserId());
-            auditEvent("UserId: " + userId + " instructing terminal to close batch");
-
-            callbackBatchCloseInProgress();
-
-            mPaymentTerminalResponse = null;
-            mWaitingForTerminalResponse = true;
-            mTerminal.sendRequest(new PaymentTerminalRequest(action)
-                    .setActivityClassToForeground(activity.getClass())
-                    .setCustomData(FlavorHelper.getCustomTerminalRequestData())
-                    .setUserId(userId));
-
-            while (mWaitingForTerminalResponse) {
-                pause(500);
-            }
-
-            if (mBatchCloseSuccess) {
-                callbackOnComplete();
-            } else if (sIsCancelled) {
-                callbackOnCancelled();
-            } else {
-                callbackOnError();
-            }
-        }
-    }
-
-    // terminal callbacks
-
-    private class TerminalCallbacks extends TerminalHelperCallbacks {
-        @Override
-        public void iM3TerminalOnResponse(PaymentTerminalResponse response) {
-            auditEvent("TerminalBatchCloseHelper terminal response action: "
-                    + response.getAction() + " / response object instance: " + response.hashCode());
-            switch (response.getAction()) {
-                case SendMessage:
-                    // Ignore all message events.
-                    return;
-
-                case UploadSafTenders:
-                case GetSafTender:
-                    mPaymentTerminalResponse = response;
-                    break;
-
-                case CloseBatch:
-                case ClearBatch:
-                    if (!response.isTerminalBatchEmpty()) {
-                        FinancialAuditHelper.terminalBatchClosed(TAG,
-                                BatchHelper.getCurrentBatchNumber(),
-                                BatchHelper.getCurrentLocalBatchNumber(), response);
-                    }
-                    mBatchCloseSuccess = true;
-                    break;
-
-                default:
-                    logEvent("Unsupported PaymentTerminalAction: " + response.getAction());
-            }
-
-            mWaitingForTerminalResponse = false;
-        }
-
-        @Override
-        public void iM3TerminalOnError(@NonNull PaymentTerminalError error) {
-            String friendlyMessage = error.getFriendlyMessage();
-            String detailedMessage = error.getDetailedMessage();
-            auditEvent("TerminalBatchCloseHelper terminal error: " + friendlyMessage +
-                    (detailedMessage != null ? " / " + detailedMessage : ""));
-            mHasError = true;
-            mBatchCloseSuccess = false;
-            mWaitingForTerminalResponse = false;
-            mReceivedSafNotFoundResponseForBatchAction = false;
-        }
-    }
-
-    // helpers
-
-    private void logEvent(String message) {
-        if (VERBOSE_LOGGING) {
-            LogHelper.write(TAG, message);
-        }
-    }
-
-    private void auditEvent(String message) {
-        LogEventHelper.saveEvent(AuditLevel.Debug, TAG, message + " (Batch number: "
-                + BatchHelper.getCurrentBatchNumber() + " / "
-                + BatchHelper.getCurrentLocalBatchNumber() + ")");
-    }
-
-    private void auditSafTenderProcessing(@NonNull String description,
-            @NonNull TxDbTender tender, @Nullable PaymentTerminalResponse response) {
-        String message = "TerminalBatchCloseHelper -> " + description + ":"
-                + " Cursor object instance " + mTenderCursor.hashCode()
-                + " / Tender object instance " + tender.hashCode()
-                + " / TenderNumber " + tender.getTenderNumber()
-                + " / Tender TotalAmount " + tender.getTotalAmount()
-                + " / Tender RedactedInfo " + tender.getRedactedInfo();
-
-        TenderAdditionalInfo additionalInfo = tender.getAdditionalInfo();
-        if (additionalInfo != null) {
-            message += " / TerminalTenderSafId " + additionalInfo.getTerminalTenderSafId()
-                    + " / TerminalTenderId " + additionalInfo.getTerminalTenderId()
-                    + " / TerminalTenderId " + additionalInfo.getTerminalTenderId()
-            ;
-        }
-
-        if (response != null) {
-            message += " Response object instance " + response.hashCode()
-                    + " / Response ApprovedAmount " + response.getApprovedAmount()
-                    + " / Response RedactedInfo " + response.getRedactedInfo()
-                    + " / Response GatewayCardToken " + response.getGatewayCardToken()
-                    + " / Response GatewayAuthCode " + response.getGatewayAuthCode()
-                    + " / Response GatewayAuthDateTime " + response.getGatewayAuthDateTime()
-            ;
-        }
-
-        auditEvent(message);
-    }
-
-    // callbacks
-
-    private void callbackSafUploadInProgress() {
-        // Lock in the values at the time this method was invoked.
-        final int completed = mCompletedCount;
-        final int total = mTotalCount;
-
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnSafUploadInProgress(completed, total);
-                }
-            }
-        });
-    }
-
-    private void callbackSafUploadComplete() {
-        // Lock in the values at the time this method was invoked.
-        final int completed = mCompletedCount;
-        final int total = mTotalCount;
-
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnSafUploadComplete(completed, total);
-                }
-            }
-        });
-    }
-
-    private void callbackSafTendersNotFound() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnSafTendersNotFound();
-                }
-            }
-        });
-    }
-
-    private void callbackBatchCloseInProgress() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnInProgress();
-                }
-            }
-        });
-    }
-
-    private void callbackOnComplete() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnComplete();
-                }
-            }
-        });
-    }
-
-    private void callbackOnCancelled() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnCancelled();
-                }
-            }
-        });
-    }
-
-    private void callbackOnBusy() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnBusy();
-                }
-            }
-        });
-    }
-
-    private void callbackTerminalConfigurationError(final String message) {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnTerminalConfigurationError(message);
-                }
-            }
-        });
-    }
-
-    private void callbackOnError() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnError();
-                }
-            }
-        });
-    }
-
-    private String getString(@StringRes int resourceId) {
-        return ResourceHelper.getString(resourceId);
+        report.userTipTotalMap = userTipTotalMap
     }
 }
-
-
-
-
-
-
-
-
- @Override
-    public Context getTargetContext() {
-        return getInstrumentation().getTargetContext();
-    }
-
-
-
-
-
-
-
-
-
-
-
-package com.imobile3.pos.data.peripherals.terminal;
-
-import android.content.Context;
-import android.os.Handler;
-import android.os.Looper;
-import android.text.TextUtils;
-
-import com.imobile3.pos.BaseUnitTest;
-import com.imobile3.pos.R;
-import com.imobile3.pos.audits.constants.enums.AuditEvent;
-import com.imobile3.pos.audits.utils.AuditHelper;
-import com.imobile3.pos.data.peripherals.terminal.TerminalRequestProcessor.Callbacks;
-import com.imobile3.pos.library.constants.enums.PaymentTerminalAction;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalError;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalRequest;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalResponse;
-import com.imobile3.pos.library.interfaces.terminal.iM3Terminal;
-import com.imobile3.pos.library.interfaces.terminal.iM3TerminalCallbacks;
-import com.imobile3.pos.library.utils.LogHelper;
-import com.imobile3.pos.library.webservices.enums.SupportedHardware;
-import com.imobile3.pos.utils.ReflectionHelper;
-
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
-import org.mockito.ArgumentCaptor;
-import org.mockito.MockedConstruction;
-import org.mockito.MockedStatic;
-import org.mockito.stubbing.Answer;
-
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.mockConstruction;
-import static org.mockito.Mockito.mockStatic;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
-
-public class TerminalRequestProcessorTest extends BaseUnitTest {
-
-    private final String mTag = TerminalRequestProcessor.class.getName();
-    private final List<SupportedHardware> mTerminals =
-            Collections.singletonList(SupportedHardware.PaxASeriesPrinter);
-    private TerminalRequestProcessor mTerminalRequestProcessor;
-    private final PaymentTerminalRequest mRequest = mock(PaymentTerminalRequest.class);
-    private final Callbacks mCallbacks = mock(Callbacks.class);
-    private final iM3Terminal mTerminal = mock(iM3Terminal.class);
-    private Context mContext;
-    private MockedStatic<TerminalHelper> mTerminalHelper;
-    private MockedStatic<LogHelper> mLogHelper;
-    private MockedStatic<AuditHelper> mAuditHelper;
-    private MockedConstruction<Handler> mHandlerConstruction;
-
-    @Before
-    @Override
-    public void setUp() {
-        super.setUp();
-
-        mContext = getApplication();
-
-        mTerminalHelper = mockStatic(TerminalHelper.class);
-        mLogHelper = mockStatic(LogHelper.class);
-        mAuditHelper = mockStatic(AuditHelper.class);
-
-        mTerminalRequestProcessor = new TerminalRequestProcessor();
-
-        Looper looper = mock(Looper.class);
-        when(mContext.getMainLooper()).thenReturn(looper);
-
-        mHandlerConstruction = mockConstruction(Handler.class);
-    }
-
-    @After
-    @Override
-    public void tearDown() {
-        super.tearDown();
-
-        mTerminalHelper.close();
-        mLogHelper.close();
-        mAuditHelper.close();
-        mHandlerConstruction.close();
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_shouldLogFailure_ifTerminalsAreNull() {
-        String failureMessage = "Available terminals list is null.";
-        String logMessage = "processRequestAgainstAvailableTerminals() Available terminals " +
-                "is null or empty";
-
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(null);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        verifyAuditHelper(logMessage);
-        verify(mCallbacks).onRequestFailure(failureMessage);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_shouldLogFailure_ifTerminalsAreEmpty() {
-        String failureMessage = "Available terminals list is null.";
-        String logMessage = "processRequestAgainstAvailableTerminals() Available terminals " +
-                "is null or empty";
-
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(new ArrayList<>());
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        verifyAuditHelper(logMessage);
-        verify(mCallbacks).onRequestFailure(failureMessage);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifTerminalInstanceIsNull() {
-        String terminalInstanceLogMessage = "processAction() Terminal instance is null. " +
-                "TerminalIndex = 0; SupportedHardwareTerminal = PaxASeriesPrinter";
-        String terminalIndexLogMessage = "processAction() All attempts to retrieve the serial " +
-                "number from the provided terminals failed. TerminalIndex = 1; Terminals.Size = 1";
-        String failureMessage =
-                String.valueOf(R.string.terminal_request_processor_all_attempts_failed_format);
-
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(mTerminals);
-        when(mContext.getString(anyInt())).then(returnArgumentsAsString());
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        verify(mCallbacks).onShowProgress();
-        verifyLogHelper(terminalInstanceLogMessage);
-        verify(mCallbacks).onNullTerminalFound();
-        verifyLogHelper(terminalIndexLogMessage);
-        verify(mCallbacks).onRequestFailure(failureMessage);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifHandlerPostDelayedIsCalled() {
-        String logMessage = "processAction() Sending request to terminal instance: " + mTerminal +
-                "; Action = null; TerminalIndex = 0; IndividualRetryCount = 0";
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                new ArrayList<>(Collections.nCopies(1, SupportedHardware.CodeCR950));
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-        when(TerminalHelper
-                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
-                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        verifyHandler();
-        verify(mCallbacks).onShowProgress();
-        verify(mTerminal).sendRequest(mRequest);
-        verifyLogHelper(logMessage);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifMaxSupportedTerminalsNumberReached() {
-        PaymentTerminalAction paymentTerminalAction = PaymentTerminalAction.Activate;
-        String logMessage = "processAction() Too many terminals are configured; " +
-                "Did you want this process to take forever? TerminalIndex = 51; Terminals.Size = 52";
-        String failureMessage = String.format("%s, %s",
-                R.string.terminal_request_processor_max_supported_terminal_format,
-                paymentTerminalAction);
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                new ArrayList<>(Collections.nCopies(52, SupportedHardware.CodeCR950));
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-
-        // Mock mTerminalIndex
-        AtomicInteger terminalIndex = mock(AtomicInteger.class);
-        when(terminalIndex.get()).thenReturn(51);
-        ReflectionHelper.setFieldValue(mTerminalRequestProcessor, "mTerminalIndex", terminalIndex);
-
-        when(mRequest.getAction()).thenReturn(paymentTerminalAction);
-        when(mContext.getString(anyInt(), any(PaymentTerminalAction.class)))
-                .then(returnArgumentsAsString());
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        verify(mCallbacks).onShowProgress();
-        verifyLogHelper(logMessage);
-        verify(mCallbacks).onRequestFailure(failureMessage);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifIndividualRetryNumberReached() {
-        String logMessage = "processAction() Exhausted all retry attempts against current " +
-                "terminal. SupportedHardwareTerminal = CodeCR950; IndividualRetryCount = 4";
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                new ArrayList<>(Collections.nCopies(2, SupportedHardware.CodeCR950));
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-
-        // Mock mIndividualTerminalRetryCount
-        AtomicInteger terminalIndex = mock(AtomicInteger.class);
-        when(terminalIndex.get()).thenReturn(4);
-        ReflectionHelper.setFieldValue(mTerminalRequestProcessor, "mIndividualTerminalRetryCount",
-                terminalIndex);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        verify(mCallbacks).onShowProgress();
-
-        mLogHelper.verify(() -> LogHelper.write(mTag, logMessage), times(2));
-
-        // Check if mTerminalIndex is incremented
-        assertPrivateMember("mTerminalIndex", 2);
-
-        // Check if mIndividualTerminalRetryCount is incremented
-        assertPrivateMember("mIndividualTerminalRetryCount", 4);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifNewTerminalInstanceIsNotNull() {
-        String exhaustedAttemptsLogMessage =
-                "processAction() Exhausted all retry attempts against current " +
-                        "terminal. SupportedHardwareTerminal = CodeCR950; IndividualRetryCount = 4";
-        String forceDisconnectLogMessage =
-                "processAction() Sending ForceDisconnect action to terminal: " + mTerminal;
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                new ArrayList<>(Collections.nCopies(2, SupportedHardware.CodeCR950));
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-
-        // Mock mIndividualTerminalRetryCount
-        AtomicInteger terminalIndex = mock(AtomicInteger.class);
-        when(terminalIndex.get()).thenReturn(4);
-        ReflectionHelper.setFieldValue(mTerminalRequestProcessor, "mIndividualTerminalRetryCount",
-                terminalIndex);
-
-        // Mock mNewTerminalInstance
-        ReflectionHelper.setFieldValue(mTerminalRequestProcessor, "mNewTerminalInstance",
-                mTerminal);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        verify(mCallbacks).onShowProgress();
-
-        mLogHelper.verify(() -> LogHelper.write(mTag, exhaustedAttemptsLogMessage), times(2));
-        verifyLogHelper(forceDisconnectLogMessage);
-
-        // Check if mNewTerminalInstance is set to null
-        iM3Terminal expectedTerminalInstance =
-                ReflectionHelper.getFieldValue(mTerminalRequestProcessor, "mNewTerminalInstance");
-        assertNull(expectedTerminalInstance);
-
-        // Check if mTerminalIndex is incremented
-        assertPrivateMember("mTerminalIndex", 2);
-
-        // Check if mIndividualTerminalRetryCount is incremented
-        assertPrivateMember("mIndividualTerminalRetryCount", 4);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifResponseIsNull() {
-        String logMessage = "processAction()->iM3TerminalOnResponse() Response from terminal is " +
-                "null, ignoring.";
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                Collections.singletonList(SupportedHardware.CodeCR950);
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-        when(TerminalHelper
-                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
-                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        // Set null Payment Terminal response
-        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
-        callbacks.iM3TerminalOnResponse(null);
-
-        verifyLogHelper(logMessage);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifResponseActionIsNotAuth() {
-        PaymentTerminalAction paymentTerminalAction = PaymentTerminalAction.Auth;
-        String logMessage = "processAction()->iM3TerminalOnResponse() Response contains an " +
-                "erroneous action: Activate; ignoring.";
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                Collections.singletonList(SupportedHardware.CodeCR950);
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-        when(TerminalHelper
-                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
-                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
-        when(mRequest.getAction()).thenReturn(paymentTerminalAction);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        // Set Payment Terminal response
-        PaymentTerminalResponse paymentTerminalResponse = mock(PaymentTerminalResponse.class);
-        when(paymentTerminalResponse.getAction()).thenReturn(PaymentTerminalAction.Activate);
-
-        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
-        callbacks.iM3TerminalOnResponse(paymentTerminalResponse);
-
-        verifyLogHelper(logMessage);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifRequestActionIsGetSerial() {
-        PaymentTerminalAction paymentTerminalAction = PaymentTerminalAction.GetSerial;
-        String logMessage = "processAction()->iM3TerminalOnResponse() Response serial number " +
-                "is null, trying again.";
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                Collections.singletonList(SupportedHardware.CodeCR950);
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-        when(TerminalHelper
-                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
-                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
-        when(mRequest.getAction()).thenReturn(paymentTerminalAction);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        // Set Payment Terminal response
-        PaymentTerminalResponse paymentTerminalResponse = mock(PaymentTerminalResponse.class);
-        when(paymentTerminalResponse.getAction()).thenReturn(paymentTerminalAction);
-        when(paymentTerminalResponse.getTerminalSerialNumber()).thenReturn("");
-        when(TextUtils.isEmpty(anyString())).thenReturn(true);
-
-        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
-        callbacks.iM3TerminalOnResponse(paymentTerminalResponse);
-
-        verifyLogHelper(logMessage);
-
-        // Check if mIndividualTerminalRetryCount is incremented
-        assertPrivateMember("mIndividualTerminalRetryCount", 1);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifResponseTerminalInstanceIsNotNull() {
-        PaymentTerminalAction paymentTerminalAction = PaymentTerminalAction.Activate;
-        String forceDisconnectLogMessage = "processAction()->iM3TerminalOnResponse() Sending " +
-                "ForceDisconnect action to terminal: " + mTerminal;
-        String responseReceivedLogMessage = "processAction()->iM3TerminalOnResponse() Received " +
-                "response from device. Ending process...";
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                Collections.singletonList(SupportedHardware.CodeCR950);
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-        when(TerminalHelper
-                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
-                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
-        when(mRequest.getAction()).thenReturn(paymentTerminalAction);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        // Set Payment Terminal response
-        PaymentTerminalResponse paymentTerminalResponse = mock(PaymentTerminalResponse.class);
-        when(paymentTerminalResponse.getAction()).thenReturn(paymentTerminalAction);
-
-        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
-        callbacks.iM3TerminalOnResponse(paymentTerminalResponse);
-
-        verifyLogHelper(forceDisconnectLogMessage);
-        verifyLogHelper(responseReceivedLogMessage);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifPaymentTerminalError() {
-        String friendlyMessage = "FriendlyMessage";
-        String detailedMessage = "DetailedMessage";
-        String logMessage = "processAction()->iM3TerminalOnError() " + "Friendly = " +
-                friendlyMessage + "; Detailed = " + detailedMessage;
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                Collections.singletonList(SupportedHardware.CodeCR950);
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-        when(TerminalHelper
-                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
-                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        // Set Payment Terminal error
-        PaymentTerminalError paymentTerminalError = mock(PaymentTerminalError.class);
-        when(paymentTerminalError.getFriendlyMessage()).thenReturn(friendlyMessage);
-        when(paymentTerminalError.getDetailedMessage()).thenReturn(detailedMessage);
-        when(TextUtils.isEmpty(anyString())).thenReturn(true);
-
-        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
-        callbacks.iM3TerminalOnError(paymentTerminalError);
-
-        verifyLogHelper(logMessage);
-
-        // Check if mIndividualTerminalRetryCount is incremented
-        assertPrivateMember("mIndividualTerminalRetryCount", 1);
-    }
-
-    @Test
-    public void testProcessRequestAgainstAvailableTerminals_ifTerminalErrorAndDetailedMessageIsNull() {
-        String detailedMessage = "DetailedMessage";
-        String logMessage = "iM3TerminalOnError:" + detailedMessage + "; RequestedAction:Auth";
-
-        // Mock maximum number of terminal
-        List<SupportedHardware> maxNumberOfTerminals =
-                Collections.singletonList(SupportedHardware.CodeCR950);
-        when(TerminalHelper.getAvailableTerminals()).thenReturn(maxNumberOfTerminals);
-        when(TerminalHelper
-                .getUnconfiguredTerminal(any(Context.class), any(SupportedHardware.class),
-                        any(iM3TerminalCallbacks.class))).thenReturn(mTerminal);
-        when(mRequest.getAction()).thenReturn(PaymentTerminalAction.Auth);
-
-        mTerminalRequestProcessor
-                .processRequestAgainstAvailableTerminals(mContext, mRequest, mCallbacks);
-
-        // Set Payment Terminal error
-        PaymentTerminalError paymentTerminalError = mock(PaymentTerminalError.class);
-        when(paymentTerminalError.getDetailedMessage()).thenReturn(detailedMessage);
-        when(TextUtils.isEmpty(anyString())).thenReturn(false);
-
-        iM3TerminalCallbacks callbacks = captureTerminalCallbacks();
-        callbacks.iM3TerminalOnError(paymentTerminalError);
-
-        mAuditHelper.verify(() -> AuditHelper.d(mTag, AuditEvent.Generic, logMessage));
-
-        // Check if mIndividualTerminalRetryCount is incremented
-        assertPrivateMember("mIndividualTerminalRetryCount", 1);
-    }
-
-    private iM3TerminalCallbacks captureTerminalCallbacks() {
-        // Create the iM3TerminalCallbacks captor
-        ArgumentCaptor<iM3TerminalCallbacks> captor =
-                ArgumentCaptor.forClass(iM3TerminalCallbacks.class);
-
-        // Verify that TerminalHelper.getUnconfiguredTermina() was called with the any first, second
-        // arguments and captor.capture() as the third argument, which is where the
-        // iM3TerminalCallbacks object is captured
-        mTerminalHelper.verify(() -> TerminalHelper.getUnconfiguredTerminal(any(Context.class),
-                any(SupportedHardware.class),
-                captor.capture()));
-
-        return captor.getValue();
-    }
-
-    private void verifyHandler() {
-        // Create the Runnable captor
-        ArgumentCaptor<Runnable> captor = ArgumentCaptor.forClass(Runnable.class);
-
-        Handler handler = mHandlerConstruction.constructed().get(0);
-        // Verify that postDelayed was called on the mock handler instance passing captor.capture()
-        // as the first argument, which is where the Runnable object is captured and anyLong() as
-        // the second argument
-        verify(handler).postDelayed(captor.capture(), anyLong());
-
-        // Get the captured Runnable object
-        Runnable runnable = captor.getValue();
-        runnable.run();
-    }
-
-    private void verifyAuditHelper(String expectedMessage) {
-        mAuditHelper.verify(() -> AuditHelper.w(mTag, AuditEvent.Generic, expectedMessage));
-    }
-
-    private void verifyLogHelper(String expectedMessage) {
-        mLogHelper.verify(() -> LogHelper.write(mTag, expectedMessage));
-    }
-
-    private void assertPrivateMember(String expectedName, int expectedValue) {
-        AtomicInteger actualValue =
-                ReflectionHelper.getFieldValue(mTerminalRequestProcessor, expectedName);
-        assertEquals(expectedValue, actualValue.get());
-    }
-
-    private Answer<String> returnArgumentsAsString() {
-        return invocation -> {
-            String separator = ", ";
-            StringBuilder result = new StringBuilder();
-
-            for (Object argument : invocation.getArguments()) {
-                result.append(argument.toString()).append(separator);
-            }
-
-            return result.substring(0, result.length() - separator.length());
-        };
-    }
-}
-
