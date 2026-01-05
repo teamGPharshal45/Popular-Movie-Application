@@ -248,3 +248,392 @@ open class GetBatchSummaryListWithReportsUseCase @Inject constructor(
         report.userTipTotalMap = userTipTotalMap
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+ *  Copyright (c) 2025 Global Payments, Inc. All rights reserved.
+ *
+ *  Redistribution and use in source and binary forms, with or without
+ *  modification, is permitted provided that adherence to the following
+ *  conditions is maintained. If you do not agree with these terms,
+ *  please do not use, install, modify or redistribute this software.
+ *
+ *  1. Redistributions of source code must retain the above copyright notice, this
+ *  list of conditions and the following disclaimer.
+ *
+ *  2. Redistributions in binary form must reproduce the above copyright notice,
+ *  this list of conditions and the following disclaimer in the documentation
+ *  and/or other materials provided with the distribution.
+ *
+ *  THIS SOFTWARE IS PROVIDED BY GLOBAL PAYMENTS, INC "AS IS" AND ANY EXPRESS OR
+ *  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ *  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+ *  EVENT SHALL GLOBAL PAYMENTS, INC OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+ *  INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ *  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+ *  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+ *  OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ *  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+package com.imobile3.pos.data.module.batch.report
+
+
+import android.util.SparseArray
+import com.imobile3.pos.data.module.batch.BatchManager
+import com.imobile3.pos.data.module.order.cart.tender.TenderManager
+import com.imobile3.pos.data.module.order.cart.transaction.TransactionRepository
+import com.imobile3.pos.library.constants.enums.CvmResult
+import com.imobile3.pos.library.domainobjects.BatchReport
+import com.imobile3.pos.library.domainobjects.TxDbTender
+import com.imobile3.pos.library.domainobjects.TxDbTransaction
+import com.imobile3.pos.library.webservices.enums.PaymentType
+import com.imobile3.pos.library.webservices.enums.TenderCreditStatusType
+import com.imobile3.pos.library.webservices.enums.TenderStatusType
+import com.imobile3.pos.library.webservices.enums.TenderType
+import com.imobile3.pos.library.webservices.transferobjects.BatchDepositDto
+import com.imobile3.pos.library.webservices.transferobjects.CustomTenderFieldsDto
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+import org.mockito.Mockito.mock
+import org.mockito.kotlin.any
+import org.mockito.kotlin.verify
+import org.mockito.kotlin.whenever
+import java.math.BigDecimal
+
+
+class GetBatchSummaryListWithReportsUseCaseTest {
+
+    private lateinit var repository: TransactionRepository
+    private lateinit var batchManager: BatchManager
+    private lateinit var tenderManager: TenderManager
+    private lateinit var useCaseTest: GetBatchSummaryListWithReportsUseCase
+
+    @Before
+    fun setUp() {
+        repository = mock(TransactionRepository::class.java)
+        batchManager = mock(BatchManager::class.java)
+        tenderManager = mock(TenderManager::class.java)
+        useCaseTest = GetBatchSummaryListWithReportsUseCase(repository, batchManager, tenderManager)
+    }
+
+    @Test
+    fun `removeZeroTotalDeposits returns list with no zero totals`() {
+        val report = BatchReport()
+        val validReportWithZeroTotal = BatchDepositDto().apply {
+            paymentType = PaymentType.Cash
+            totalAmount = BigDecimal.ZERO
+        }
+        val validReportWithNonzeroTotal = BatchDepositDto().apply {
+            paymentType = PaymentType.Cash
+            totalAmount = BigDecimal("10.00")
+        }
+        report.addDeposit(validReportWithZeroTotal)
+        report.addDeposit(validReportWithNonzeroTotal)
+
+        assertEquals(2, report.deposits.size)
+
+        useCaseTest.removeZeroTotalDeposits(report)
+
+        assertEquals(1, report.deposits.size)
+        assertEquals(BigDecimal("10.00"), report.deposits[0].totalAmount)
+    }
+
+    @Test
+    fun `shouldUpdateTenderCount returns true when valid credit card authorized`() {
+        val tender = TxDbTender().apply {
+            paymentType = PaymentType.CreditCard
+            tenderCreditStatusType = TenderCreditStatusType.Authorized
+            cvmResult = CvmResult.SignatureRequired
+        }
+
+        val result = useCaseTest.shouldUpdateTenderCount(
+            TenderType.Normal,
+            TenderStatusType.Completed,
+            tender
+        )
+
+        assertTrue(result)
+    }
+
+    @Test
+    fun `shouldUpdateTenderCount returns false when non-credit payments are passed`() {
+        val tender = TxDbTender().apply {
+            paymentType = PaymentType.Cash
+        }
+
+        val result = useCaseTest.shouldUpdateTenderCount(
+            TenderType.Normal,
+            TenderStatusType.Completed,
+            tender
+        )
+
+        assertFalse(result)
+    }
+
+    @Test
+    fun `getCustomTenderDeposits adds new custom deposit when none exists`() {
+        val report = BatchReport()
+        val tender = TxDbTender().apply {
+            paymentType = PaymentType.CustomTender
+            orderAmount = BigDecimal("5.00")
+            tipAmount = BigDecimal("1.00")
+            changeAmount = BigDecimal.ZERO
+            totalAmount = BigDecimal("6.00")
+            amountReceived = BigDecimal("6.00")
+            customFields = CustomTenderFieldsDto().apply {
+                customTenderId = 101
+            }
+        }
+
+        whenever(batchManager.getCustomTenderFieldsDto(any())).thenReturn(null)
+
+        useCaseTest.getCustomTenderDeposits(report, tender, "tag")
+
+        assertEquals(1, report.deposits.size)
+
+        val addedDeposits = report.deposits[0]
+
+        assertEquals(PaymentType.CustomTender, addedDeposits.paymentType)
+        assertEquals(BigDecimal("5.00"), addedDeposits.orderAmount)
+        assertEquals(BigDecimal("6.00"), addedDeposits.totalAmount)
+    }
+
+    @Test
+    fun `getCustomTenderDeposits merges into existing deposit when customTenderId matches`() {
+        val report = BatchReport()
+
+        val existing = BatchDepositDto().apply {
+            paymentType = PaymentType.CustomTender
+            orderAmount = BigDecimal("3.00")
+            tipAmount = BigDecimal("0.50")
+            changeAmount = BigDecimal.ZERO
+            totalAmount = BigDecimal("3.50")
+            amountReceived = BigDecimal("3.50")
+        }
+
+        report.addDeposit(existing)
+
+        val existingFields = CustomTenderFieldsDto()
+        existingFields.customTenderId = 101
+        whenever(batchManager.getCustomTenderFieldsDto(existing)).thenReturn(existingFields)
+
+        val tender = TxDbTender().apply {
+            paymentType = PaymentType.CustomTender
+            orderAmount = BigDecimal("2.00")
+            tipAmount = BigDecimal("0.25")
+            changeAmount = BigDecimal.ZERO
+            totalAmount = BigDecimal("2.25")
+            amountReceived = BigDecimal("2.25")
+            customFields = existingFields
+        }
+
+        useCaseTest.getCustomTenderDeposits(report, tender, "tag")
+
+        assertEquals(1, report.deposits.size)
+        val merged = report.deposits[0]
+
+        assertEquals(BigDecimal("5.00"), merged.orderAmount)
+        assertEquals(BigDecimal("0.75"), merged.tipAmount)
+        assertEquals(BigDecimal("5.75"), merged.totalAmount)
+    }
+
+    @Test(expected = Exception::class)
+    fun `getBatchReport rethrows exceptions from repository`() {
+        whenever(repository.getTransactionsFromBatchNumber(999L))
+            .thenThrow(RuntimeException("db fail"))
+
+        useCaseTest.getBatchReport("tag", 999L)
+    }
+
+    @Test
+    fun `generateUserTipTotal adds tip total for user`() {
+        val report = mock(BatchReport::class.java)
+        val userTipTotalMap = mock(SparseArray::class.java) as SparseArray<BigDecimal?>
+
+        whenever(report.userTipTotalMap).thenReturn(userTipTotalMap)
+        whenever(userTipTotalMap.get(42)).thenReturn(null)
+
+        val transaction = mock(TxDbTransaction::class.java)
+        whenever(transaction.userId).thenReturn(42)
+        whenever(transaction.totalTips).thenReturn(BigDecimal("15.00"))
+
+        useCaseTest.generateUserTipTotal(transaction, report)
+
+        verify(userTipTotalMap).put(42, BigDecimal("15.00"))
+    }
+
+    @Test
+    fun `removeZeroTotalDeposits removes all deposits when all are zero`() {
+        val report = BatchReport()
+        val zeroDeposit1 = BatchDepositDto().apply {
+            paymentType = PaymentType.Cash
+            totalAmount = BigDecimal.ZERO
+        }
+        val zeroDeposit2 = BatchDepositDto().apply {
+            paymentType = PaymentType.CreditCard
+            totalAmount = BigDecimal.ZERO
+        }
+        val zeroDeposit3 = BatchDepositDto().apply {
+            paymentType = PaymentType.CustomTender
+            totalAmount = BigDecimal.ZERO
+        }
+
+        report.addDeposit(zeroDeposit1)
+        report.addDeposit(zeroDeposit2)
+        report.addDeposit(zeroDeposit3)
+
+        assertEquals(3, report.deposits.size)
+
+        useCaseTest.removeZeroTotalDeposits(report)
+
+        assertEquals(0, report.deposits.size)
+    }
+
+    @Test
+    fun `removeZeroTotalDeposits handles empty deposit list`() {
+        val report = BatchReport()
+
+        assertEquals(0, report.deposits.size)
+
+        useCaseTest.removeZeroTotalDeposits(report)
+
+        assertEquals(0, report.deposits.size)
+    }
+
+    @Test
+    fun `shouldUpdateTenderCount returns false when tender type is null`() {
+        val tender = TxDbTender().apply {
+            paymentType = PaymentType.CreditCard
+            tenderCreditStatusType = TenderCreditStatusType.Authorized
+            cvmResult = CvmResult.SignatureRequired
+        }
+
+        val result = useCaseTest.shouldUpdateTenderCount(null, TenderStatusType.Completed, tender)
+
+        assertFalse(result)
+    }
+
+    @Test
+    fun `shouldUpdateTenderCount returns false for Cancelled status`() {
+        val tender = TxDbTender().apply {
+            paymentType = PaymentType.CreditCard
+            tenderCreditStatusType = TenderCreditStatusType.Authorized
+            cvmResult = CvmResult.SignatureRequired
+        }
+
+        val result = useCaseTest.shouldUpdateTenderCount(
+            TenderType.Normal,
+            TenderStatusType.Cancelled,
+            tender
+        )
+
+        assertFalse(result)
+    }
+
+    @Test
+    fun `shouldUpdateTenderCount returns false for status other than Completed or RefundedItems`() {
+        val tender = TxDbTender().apply {
+            paymentType = PaymentType.CreditCard
+            tenderCreditStatusType = TenderCreditStatusType.Authorized
+            cvmResult = CvmResult.SignatureRequired
+        }
+
+        val result = useCaseTest.shouldUpdateTenderCount(
+            TenderType.Normal,
+            TenderStatusType.Pending,
+            tender
+        )
+
+        assertFalse(result)
+    }
+
+    @Test
+    fun `shouldUpdateTenderCount returns false when status is null`() {
+        val tender = TxDbTender().apply {
+            paymentType = PaymentType.CreditCard
+            tenderCreditStatusType = TenderCreditStatusType.Authorized
+            cvmResult = CvmResult.SignatureRequired
+        }
+
+        val result = useCaseTest.shouldUpdateTenderCount(TenderType.Normal, null, tender)
+
+        assertFalse(result)
+    }
+
+    @Test
+    fun `generateDeposits returns early when tenders is null`() {
+        val report = BatchReport()
+
+        useCaseTest.generateDeposits("tag", null, report)
+
+        assertEquals(0, report.deposits.size)
+    }
+
+    @Test
+    fun `generateUserTipTotal adds tip total for user (mocked SparseArray)`() {
+            val userId = 1
+            val tipTotal = BigDecimal("5.00")
+
+            val mockSparseArray = mock<SparseArray<BigDecimal?>>()
+            whenever(mockSparseArray.get(userId)).thenReturn(null)
+            whenever(mockSparseArray.put(userId, tipTotal)).then { /* no-op */ }
+
+            val report = mock(BatchReport::class.java)
+            whenever(report.userTipTotalMap).thenReturn(mockSparseArray)
+
+            val transaction = mock(TxDbTransaction::class.java)
+            whenever(transaction.userId).thenReturn(userId)
+            whenever(transaction.totalTips).thenReturn(tipTotal)
+
+            val useCase = GetBatchSummaryListWithReportsUseCase(mock(), mock(), mock())
+            useCase.generateUserTipTotal(transaction, report)
+
+            verify(mockSparseArray).put(userId, tipTotal)
+    }
+
+    
+}
