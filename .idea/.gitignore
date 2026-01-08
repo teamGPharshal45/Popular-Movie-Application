@@ -1,639 +1,534 @@
-package com.imobile3.pos.data.module.batch.report
-
-import android.database.Cursor
-import android.util.SparseArray
-import androidx.annotation.VisibleForTesting
-import androidx.annotation.WorkerThread
-import com.imobile3.pos.data.module.batch.BatchManager
-import com.imobile3.pos.data.module.order.cart.tender.TenderManager
-import com.imobile3.pos.data.module.order.cart.transaction.TransactionRepository
-import com.imobile3.pos.library.constants.enums.CvmResult
-import com.imobile3.pos.library.database.extensions.map
-import com.imobile3.pos.library.domainobjects.BatchReport
-import com.imobile3.pos.library.domainobjects.TxDbTender
-import com.imobile3.pos.library.domainobjects.TxDbTransaction
-import com.imobile3.pos.library.utils.LogHelper
-import com.imobile3.pos.library.webservices.enums.PaymentType
-import com.imobile3.pos.library.webservices.enums.TenderCreditStatusType
-import com.imobile3.pos.library.webservices.enums.TenderStatusType
-import com.imobile3.pos.library.webservices.enums.TenderType
-import com.imobile3.pos.library.webservices.enums.TransactionStatusType
-import com.imobile3.pos.library.webservices.transferobjects.BatchDepositDto
-import com.imobile3.pos.library.webservices.transferobjects.CustomTenderFieldsDto
-import java.math.BigDecimal
-import java.util.logging.Level
-import javax.inject.Inject
-
-open class GetBatchSummaryListWithReportsUseCase @Inject constructor(
-    private val transactionRepository: TransactionRepository,
-    private val batchManager: BatchManager,
-    private val tenderManager: TenderManager
-) {
-
-    @WorkerThread
-    open fun execute(tag: String, batchNumbers: List<Long>): List<BatchSummaryResponse> =
-        batchNumbers.map { batchNumber ->
-            BatchSummaryResponse().apply {
-                this.batchNumber = batchNumber
-                this.batchReport = getBatchReport(tag, batchNumber)
-            }
-        }
-
-    /**
-     * @throws Exception if an error occurs while generating the batch report.
-     * The exact cause of the exception occurring in Production is unknown at
-     * this time, but we suspect it is related to a backwards-incompatibility
-     * issue with the [CvmResult] stored in our local database, from a previous
-     * version of the POS app.
-     */
-    @VisibleForTesting
-    fun getBatchReport(tag: String, batchNumber: Long): BatchReport {
-        val report = BatchReport()
-        var cursor: Cursor? = null
-
-        try {
-            cursor = transactionRepository.getTransactionsFromBatchNumber(batchNumber)
-
-            cursor?.map {
-                val transaction: TxDbTransaction =
-                    transactionRepository.getTransactionFromCursor(it)
-                val status: TransactionStatusType? = transaction.transactionStatusType
-
-                if (!(status == TransactionStatusType.Cancelled
-                            || status == TransactionStatusType.Pending)
-                ) {
-                    generateDeposits(
-                        tag, transactionRepository.getTendersByTransactionNumber(
-                            transaction.transactionNumber
-                        ), report
-                    )
-                    generateUserTipTotal(transaction, report)
-                }
-            }
-
-            removeZeroTotalDeposits(report)
-        } catch (e: Exception) {
-            LogHelper.write(
-                Level.SEVERE, tag,
-                "getBatchReport() -> Exception thrown while generating batch report" +
-                        " for Batch Number $batchNumber -> Re-throwing exception: ${e.message}"
-            )
-
-            // We want the BaseViewModel.launchDataLoad function to catch this exception,
-            // and then execute the 'doOnThrowable' pathway, which will allow our ViewModel
-            // to save the Exception to our Azure Service Bus and emit a UI error event.
-            throw e
-        } finally {
-            cursor?.let {
-                if (!it.isClosed) it.close()
-            }
-        }
-
-        return report
-    }
-
-    /**
-     * Removes all [BatchDepositDto] from [report] with TotalAmount zero
-     */
-    @VisibleForTesting
-    fun removeZeroTotalDeposits(report: BatchReport) {
-        // Report.Deposits is initialized to an empty list in the constructor.
-        val deposits: List<BatchDepositDto> =
-            report.deposits.filter { deposit -> deposit.totalAmount.signum() != 0 }
-
-        report.deposits = deposits
-    }
-
-    @VisibleForTesting
-    fun generateDeposits(tag: String, tenders: List<TxDbTender>?, report: BatchReport) {
-        if (tenders == null) {
-            LogHelper.writeWithTrace(Level.WARNING, tag, "Tenders argument is null")
-            return
-        }
-
-        tenders.forEach { tender ->
-            val status: TenderStatusType? = tender.tenderStatusType
-            val type: TenderType? = tender.tenderType
-
-            if (!TenderManager.isTenderStatusTypeValid(status)) {
-                return@forEach
-            }
-
-            // Don't include non authorized tenders that were removed prior to completion of the
-            // transaction
-            if (tenderManager.isNonAuthTender(tender) && TenderManager.isCancelled(tender)) {
-                return@forEach
-            }
-
-            // Don't include voided non authorised tenders like Cash, Checks in calculations
-            if (tenderManager.isNonAuthTender(tender) && TenderManager.isVoided(tender)) {
-                return@forEach
-            }
-
-            // Don't include tenders that failed to void
-            if (TenderManager.isFailedToVoid(tender)) {
-                return@forEach
-            }
-
-            // Update Initial Tip Adjust Tender Count
-            if (shouldUpdateTenderCount(type, status, tender)) {
-                report.tipAdjustTenderCount = report.tipAdjustTenderCount + 1
-            }
-
-            getCustomTenderDeposits(report, tender, tag)
-        }
-    }
-
-    @VisibleForTesting
-    fun shouldUpdateTenderCount(
-        type: TenderType?,
-        status: TenderStatusType?,
-        tender: TxDbTender,
-    ): Boolean {
-        return (type == TenderType.Normal || type == TenderType.Split)
-                && (status == TenderStatusType.Completed ||
-                status == TenderStatusType.RefundedItems)
-                && tender.paymentType == PaymentType.CreditCard
-                && tender.tenderCreditStatusType == TenderCreditStatusType.Authorized
-                && tender.cvmResult != CvmResult.PinOnline
-                && tender.cvmResult != CvmResult.PinOfflinePlain
-                && tender.cvmResult != CvmResult.PinOfflineEncr
-                && tender.cvmResult != null
-    }
-
-    /**
-     * Create/Update Deposit
-     *
-     * MULTIPLE Custom Tender Batch Deposits will be created to keep track of the specific
-     * custom tender details
-     */
-    @VisibleForTesting
-     fun getCustomTenderDeposits(
-        report: BatchReport,
-        tender: TxDbTender,
-        tag: String
-    ) {
-        var depositToAdjust: BatchDepositDto? = null
-        var addDeposit = true
-
-        for (deposit in report.deposits) {
-            if (deposit.paymentType == tender.paymentType) {
-                // Custom Tenders
-                if (deposit.paymentType == PaymentType.CustomTender) {
-                    val depositFields: CustomTenderFieldsDto? =
-                        batchManager.getCustomTenderFieldsDto(deposit)
-                    val tenderFields: CustomTenderFieldsDto? = tender.customFields
-                    if (depositFields?.customTenderId == tenderFields?.customTenderId) {
-                        depositToAdjust = deposit
-                        addDeposit = false
-                        break
-                    }
-                } else {
-                    depositToAdjust = deposit
-                    addDeposit = false
-                    break
-                }
-            }
-        }
-
-        if (depositToAdjust == null) {
-            depositToAdjust = BatchDepositDto().apply {
-                paymentType = tender.paymentType
-                orderAmount = BigDecimal.ZERO
-                tipAmount = BigDecimal.ZERO
-                changeAmount = BigDecimal.ZERO
-                totalAmount = BigDecimal.ZERO // Expected
-                amountReceived = BigDecimal.ZERO
-                depositAmount = BigDecimal.ZERO // Actual
-                overShortAmount = BigDecimal.ZERO // Difference (Actual - Expected)
-            }
-        }
-
-        depositToAdjust.apply {
-            orderAmount += tender.orderAmount ?: BigDecimal.ZERO
-            tipAmount += tender.tipAmount ?: BigDecimal.ZERO
-            changeAmount += tender.changeAmount ?: BigDecimal.ZERO
-            totalAmount += tender.totalAmount ?: BigDecimal.ZERO
-            amountReceived += tender.amountReceived ?: BigDecimal.ZERO
-            tender.customFields?.let {
-                customTenderFields = it.toJson()
-            }
-        }
-
-        if (addDeposit) {
-            LogHelper.writeWithTrace(
-                Level.FINE, tag,
-                "Adding deposit to Batch Report: $depositToAdjust"
-            )
-            report.addDeposit(depositToAdjust)
-        }
-    }
-
-    @VisibleForTesting
-    fun generateUserTipTotal(transaction: TxDbTransaction, report: BatchReport) {
-        // Report.UserTipTotalMap is initialized to an empty SparseArray in the constructor.
-        val userTipTotalMap: SparseArray<BigDecimal?> = report.userTipTotalMap
-        val userId = transaction.userId
-
-        val tipTotal = transaction.totalTips ?: BigDecimal.ZERO
-
-        if (userTipTotalMap[userId] == null) {
-            // New Entry
-            userTipTotalMap.put(userId, tipTotal)
-        } else {
-            // Existing Entry : Add previous value to new value
-            userTipTotalMap.put(userId, userTipTotalMap[userId]?.add(tipTotal))
-        }
-
-        report.userTipTotalMap = userTipTotalMap
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*
- *  Copyright (c) 2025 Global Payments, Inc. All rights reserved.
- *
- *  Redistribution and use in source and binary forms, with or without
- *  modification, is permitted provided that adherence to the following
- *  conditions is maintained. If you do not agree with these terms,
- *  please do not use, install, modify or redistribute this software.
- *
- *  1. Redistributions of source code must retain the above copyright notice, this
- *  list of conditions and the following disclaimer.
- *
- *  2. Redistributions in binary form must reproduce the above copyright notice,
- *  this list of conditions and the following disclaimer in the documentation
- *  and/or other materials provided with the distribution.
- *
- *  THIS SOFTWARE IS PROVIDED BY GLOBAL PAYMENTS, INC "AS IS" AND ANY EXPRESS OR
- *  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- *  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
- *  EVENT SHALL GLOBAL PAYMENTS, INC OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
- *  INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- *  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
- *  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
- *  OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
- *  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-package com.imobile3.pos.data.module.batch.report
-
-
-import android.util.SparseArray
-import com.imobile3.pos.data.module.batch.BatchManager
-import com.imobile3.pos.data.module.order.cart.tender.TenderManager
-import com.imobile3.pos.data.module.order.cart.transaction.TransactionRepository
-import com.imobile3.pos.library.constants.enums.CvmResult
-import com.imobile3.pos.library.domainobjects.BatchReport
-import com.imobile3.pos.library.domainobjects.TxDbTender
-import com.imobile3.pos.library.domainobjects.TxDbTransaction
-import com.imobile3.pos.library.webservices.enums.PaymentType
-import com.imobile3.pos.library.webservices.enums.TenderCreditStatusType
-import com.imobile3.pos.library.webservices.enums.TenderStatusType
-import com.imobile3.pos.library.webservices.enums.TenderType
-import com.imobile3.pos.library.webservices.transferobjects.BatchDepositDto
-import com.imobile3.pos.library.webservices.transferobjects.CustomTenderFieldsDto
-import org.junit.Assert.*
-import org.junit.Before
-import org.junit.Test
-import org.mockito.Mockito.mock
-import org.mockito.kotlin.any
-import org.mockito.kotlin.verify
-import org.mockito.kotlin.whenever
-import java.math.BigDecimal
-
-
-class GetBatchSummaryListWithReportsUseCaseTest {
-
-    private lateinit var repository: TransactionRepository
-    private lateinit var batchManager: BatchManager
-    private lateinit var tenderManager: TenderManager
-    private lateinit var useCaseTest: GetBatchSummaryListWithReportsUseCase
+class BatchTotalsTest {
+    private var userHelperStatic: MockedStatic<UserHelper>? = null
+    private var batchHelperStatic: MockedStatic<BatchHelper>? = null
+    private lateinit var mockIdManager: IdManager
+    private lateinit var mockAppEntry: AppEntryPoint
 
     @Before
     fun setUp() {
-        repository = mock(TransactionRepository::class.java)
-        batchManager = mock(BatchManager::class.java)
-        tenderManager = mock(TenderManager::class.java)
-        useCaseTest = GetBatchSummaryListWithReportsUseCase(repository, batchManager, tenderManager)
+        mockAppEntry = mock(AppEntryPoint::class.java)
+        mockIdManager = mock(IdManager::class.java)
+        userHelperStatic = mockStatic(UserHelper::class.java)
+        batchHelperStatic = mockStatic(com.imobile3.pos.data.module.batch.BatchHelper::class.java)
+        whenever(UserHelper.getUserId()).thenReturn(123)
+        whenever(BatchHelper.getCurrentBatchNumber()).thenReturn(456)
+    }
+
+    @After
+    fun tearDown() {
+        userHelperStatic?.close()
+        batchHelperStatic?.close()
     }
 
     @Test
-    fun `removeZeroTotalDeposits returns list with no zero totals`() {
-        val report = BatchReport()
-        val validReportWithZeroTotal = BatchDepositDto().apply {
-            paymentType = PaymentType.Cash
-            totalAmount = BigDecimal.ZERO
-        }
-        val validReportWithNonzeroTotal = BatchDepositDto().apply {
-            paymentType = PaymentType.Cash
-            totalAmount = BigDecimal("10.00")
-        }
-        report.addDeposit(validReportWithZeroTotal)
-        report.addDeposit(validReportWithNonzeroTotal)
+    fun `populate returns batchTotal with expected sum  when correct params passed`() {
+        val creditDeposit = mock(BatchDepositDto::class.java)
+        whenever(creditDeposit.paymentType).thenReturn(PaymentType.CreditCard)
+        whenever(creditDeposit.totalAmount).thenReturn(BigDecimal("100.00"))
+        whenever(creditDeposit.amountReceived).thenReturn(BigDecimal("101.50"))
 
-        assertEquals(2, report.deposits.size)
+        val cashDeposit = mock(BatchDepositDto::class.java)
+        whenever(cashDeposit.paymentType).thenReturn(PaymentType.Cash)
+        whenever(cashDeposit.totalAmount).thenReturn(BigDecimal("50.00"))
+        whenever(cashDeposit.orderAmount).thenReturn(BigDecimal("49.00"))
+        whenever(cashDeposit.tipAmount).thenReturn(BigDecimal("5.00"))
 
-        useCaseTest.removeZeroTotalDeposits(report)
+        val debitDeposit = mock(BatchDepositDto::class.java)
+        whenever(debitDeposit.paymentType).thenReturn(PaymentType.DebitCard)
+        whenever(debitDeposit.totalAmount).thenReturn(BigDecimal("20.00"))
+        whenever(debitDeposit.amountReceived).thenReturn(BigDecimal("20.00"))
 
-        assertEquals(1, report.deposits.size)
-        assertEquals(BigDecimal("10.00"), report.deposits[0].totalAmount)
-    }
+        val checkDeposit = mock(BatchDepositDto::class.java)
+        whenever(checkDeposit.paymentType).thenReturn(PaymentType.Check)
+        whenever(checkDeposit.totalAmount).thenReturn(BigDecimal("10.00"))
+        whenever(checkDeposit.amountReceived).thenReturn(BigDecimal("10.00"))
 
-    @Test
-    fun `shouldUpdateTenderCount returns true when valid credit card authorized`() {
-        val tender = TxDbTender().apply {
-            paymentType = PaymentType.CreditCard
-            tenderCreditStatusType = TenderCreditStatusType.Authorized
-            cvmResult = CvmResult.SignatureRequired
-        }
+        val giftCertDeposit = mock(BatchDepositDto::class.java)
+        whenever(giftCertDeposit.paymentType).thenReturn(PaymentType.GiftCertificate)
+        whenever(giftCertDeposit.totalAmount).thenReturn(BigDecimal("5.00"))
+        whenever(giftCertDeposit.amountReceived).thenReturn(BigDecimal("4.00"))
 
-        val result = useCaseTest.shouldUpdateTenderCount(
-            TenderType.Normal,
-            TenderStatusType.Completed,
-            tender
+        val giftCardDeposit = mock(BatchDepositDto::class.java)
+        whenever(giftCardDeposit.paymentType).thenReturn(PaymentType.GiftCard)
+        whenever(giftCardDeposit.totalAmount).thenReturn(BigDecimal("6.00"))
+        whenever(giftCardDeposit.amountReceived).thenReturn(BigDecimal("6.00"))
+
+        val customDeposit = mock(BatchDepositDto::class.java)
+        whenever(customDeposit.paymentType).thenReturn(PaymentType.CustomTender)
+        whenever(customDeposit.totalAmount).thenReturn(BigDecimal("2.00"))
+        whenever(customDeposit.amountReceived).thenReturn(BigDecimal("1.50"))
+
+        val ebtDeposit = mock(BatchDepositDto::class.java)
+        whenever(ebtDeposit.paymentType).thenReturn(PaymentType.EbtCard)
+        whenever(ebtDeposit.totalAmount).thenReturn(BigDecimal("7.00"))
+        whenever(ebtDeposit.amountReceived).thenReturn(BigDecimal("7.00"))
+
+        val safeDropTransfer = mock(TxDbBatchTransfer::class.java)
+        whenever(safeDropTransfer.transferTypeId).thenReturn(TransferType.SafeDrop)
+        whenever(safeDropTransfer.amount).thenReturn(BigDecimal("1000.00"))
+
+        val cashInTransfer = mock(TxDbBatchTransfer::class.java)
+        whenever(cashInTransfer.transferTypeId).thenReturn(TransferType.CashIn)
+        whenever(cashInTransfer.amount).thenReturn(BigDecimal("30.00"))
+
+        val deposits = listOf(
+            creditDeposit,
+            cashDeposit,
+            debitDeposit,
+            checkDeposit,
+            giftCertDeposit,
+            giftCardDeposit,
+            customDeposit,
+            ebtDeposit
         )
+        val transfers = listOf(safeDropTransfer, cashInTransfer)
+        val totals = BatchTotals.populate(deposits, transfers)
 
-        assertTrue(result)
+        assertTrue(totals.mNeedsCreditDeposit)
+        assertTrue(totals.mNeedsCashDeposit)
+        assertTrue(totals.mNeedsDebitDeposit)
+        assertTrue(totals.mNeedsCheckDeposit)
+        assertTrue(totals.mNeedsGiftCertificateDeposit)
+        assertTrue(totals.mNeedsGiftCardDeposit)
+        assertTrue(totals.mNeedsCustomTendersDeposit)
+        assertTrue(totals.mNeedsEbtDeposit)
+
+        assertEquals(BigDecimal("100.00"), totals.mCreditExpectedTotal)
+        assertEquals(BigDecimal("101.50"), totals.mCreditReceivedTotal)
+        assertEquals(BigDecimal("80.00"), totals.mCashExpectedTotal)
+        assertEquals(BigDecimal("49.00"), totals.mCashReceivedTotal)
+        assertEquals(BigDecimal("5.00"), totals.mCashTips)
+        assertEquals(BigDecimal("20.00"), totals.mDebitExpectedTotal)
+        assertEquals(BigDecimal("20.00"), totals.mDebitReceivedTotal)
+        assertEquals(BigDecimal("10.00"), totals.mCheckExpectedTotal)
+        assertEquals(BigDecimal("10.00"), totals.mCheckReceivedTotal)
+        assertEquals(BigDecimal("5.00"), totals.mGiftCertificateExpectedTotal)
+        assertEquals(BigDecimal("4.00"), totals.mGiftCertificateReceivedTotal)
+        assertEquals(BigDecimal("6.00"), totals.mGiftCardExpectedTotal)
+        assertEquals(BigDecimal("6.00"), totals.mGiftCardReceivedTotal)
+        assertEquals(BigDecimal("2.00"), totals.mCustomTenderExpectedTotal)
+        assertEquals(BigDecimal("1.50"), totals.mCustomTenderReceivedTotal)
+        assertEquals(BigDecimal("7.00"), totals.mEbtExpectedTotal)
+        assertEquals(BigDecimal("7.00"), totals.mEbtReceivedTotal)
     }
 
     @Test
-    fun `shouldUpdateTenderCount returns false when non-credit payments are passed`() {
-        val tender = TxDbTender().apply {
-            paymentType = PaymentType.Cash
+    fun `calculateOverShortTotals computes over short when correct deposit types passed`() {
+        val totals = BatchTotals()
+        totals.mCreditExpectedTotal = BigDecimal("100.00")
+        totals.mCreditReceivedTotal = BigDecimal("110.00")
+        totals.mNeedsCreditDeposit = true
+
+        totals.mCashExpectedTotal = BigDecimal("80.00")
+        totals.mCashReceivedTotal = BigDecimal("70.00")
+        totals.mNeedsCashDeposit = true
+
+        totals.mDebitExpectedTotal = BigDecimal("20.00")
+        totals.mDebitReceivedTotal = BigDecimal("25.00")
+        totals.mNeedsDebitDeposit = false
+
+        totals.calculateOverShortTotals()
+
+        assertNotNull(totals.mCreditOverShort)
+        assertEquals(BigDecimal("10.00"), totals.mCreditOverShort)
+
+        assertNotNull(totals.mCashOverShort)
+        assertEquals(BigDecimal("-10.00"), totals.mCashOverShort)
+
+        assertNull(totals.mDebitOverShort)
+    }
+}
+
+
+package com.imobile3.pos.data.module.batch.close;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.annotation.VisibleForTesting;
+
+import com.imobile3.pos.data.IdManager;
+import com.imobile3.pos.data.di.AppEntryPoint;
+import com.imobile3.pos.data.module.account.repository.UserHelper;
+import com.imobile3.pos.data.module.batch.BatchHelper;
+import com.imobile3.pos.library.domainobjects.TxDbBatchTransfer;
+import com.imobile3.pos.library.utils.LogHelper;
+import com.imobile3.pos.library.webservices.enums.TransferType;
+import com.imobile3.pos.library.webservices.transferobjects.BatchDepositDto;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+
+public class BatchTotals {
+    private static final String TAG = "BatchTotals";
+    @VisibleForTesting
+    public boolean mNeedsCreditDeposit;
+    @VisibleForTesting
+    public boolean mNeedsCashDeposit;
+    @VisibleForTesting
+    public boolean mNeedsDebitDeposit;
+    @VisibleForTesting
+    public boolean mNeedsCheckDeposit;
+    @VisibleForTesting
+    public boolean mNeedsGiftCertificateDeposit;
+    @VisibleForTesting
+    public boolean mNeedsGiftCardDeposit;
+    @VisibleForTesting
+    public boolean mNeedsCustomTendersDeposit;
+    @VisibleForTesting
+    public boolean mNeedsEbtDeposit;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCreditExpectedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCreditReceivedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCashExpectedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCashReceivedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCashTips;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mDebitExpectedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mDebitReceivedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCheckExpectedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCheckReceivedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mGiftCertificateExpectedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mGiftCertificateReceivedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mGiftCardExpectedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mGiftCardReceivedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCustomTenderExpectedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mCustomTenderReceivedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mEbtExpectedTotal;
+    @NonNull
+    @VisibleForTesting
+    public BigDecimal mEbtReceivedTotal;
+    @Nullable
+    @VisibleForTesting
+    public BigDecimal mCreditOverShort;
+    @Nullable
+    @VisibleForTesting
+    public BigDecimal mCashOverShort;
+    @Nullable
+    @VisibleForTesting
+    public BigDecimal mDebitOverShort;
+    @Nullable
+    @VisibleForTesting
+    public BigDecimal mEbtOverShort;
+    @Nullable
+    @VisibleForTesting
+    public BigDecimal mGiftCardOverShort;
+    @Nullable
+    @VisibleForTesting
+    public BigDecimal mGiftCertificateOverShort;
+    @Nullable
+    @VisibleForTesting
+    public BigDecimal mCheckOverShort;
+    @Nullable
+    private BigDecimal mCustomTenderOverShort;
+
+    public BatchTotals() {
+        mCreditExpectedTotal = BigDecimal.ZERO;
+        mCreditReceivedTotal = BigDecimal.ZERO;
+        mCashExpectedTotal = BigDecimal.ZERO;
+        mCashReceivedTotal = BigDecimal.ZERO;
+        mCashTips = BigDecimal.ZERO;
+        mDebitExpectedTotal = BigDecimal.ZERO;
+        mDebitReceivedTotal = BigDecimal.ZERO;
+        mCheckExpectedTotal = BigDecimal.ZERO;
+        mCheckReceivedTotal = BigDecimal.ZERO;
+        mGiftCertificateExpectedTotal = BigDecimal.ZERO;
+        mGiftCertificateReceivedTotal = BigDecimal.ZERO;
+        mGiftCardExpectedTotal = BigDecimal.ZERO;
+        mGiftCardReceivedTotal = BigDecimal.ZERO;
+        mCustomTenderExpectedTotal = BigDecimal.ZERO;
+        mCustomTenderReceivedTotal = BigDecimal.ZERO;
+        mEbtExpectedTotal = BigDecimal.ZERO;
+        mEbtReceivedTotal = BigDecimal.ZERO;
+    }
+
+    public void calculateOverShortTotals() {
+        if (mNeedsCreditDeposit) {
+            mCreditOverShort = mCreditReceivedTotal.subtract(mCreditExpectedTotal);
         }
 
-        val result = useCaseTest.shouldUpdateTenderCount(
-            TenderType.Normal,
-            TenderStatusType.Completed,
-            tender
-        )
+        if (mNeedsCashDeposit) {
+            mCashOverShort = mCashReceivedTotal.subtract(mCashExpectedTotal);
+        }
 
-        assertFalse(result)
+        if (mNeedsDebitDeposit) {
+            mDebitOverShort = mDebitReceivedTotal.subtract(mDebitExpectedTotal);
+        }
+
+        if (mNeedsEbtDeposit) {
+            mEbtOverShort = mEbtReceivedTotal.subtract(mEbtExpectedTotal);
+        }
+
+        if (mNeedsGiftCardDeposit) {
+            mGiftCardOverShort = mGiftCardReceivedTotal.subtract(mGiftCardExpectedTotal);
+        }
+
+        if (mNeedsGiftCertificateDeposit) {
+            mGiftCertificateOverShort =
+                    mGiftCertificateReceivedTotal.subtract(mGiftCertificateExpectedTotal);
+        }
+
+        if (mNeedsCheckDeposit) {
+            mCheckOverShort = mCheckReceivedTotal.subtract(mCheckExpectedTotal);
+        }
+
+        // TODO
+        /*if (mNeedsCustomTendersDeposit) {
+            for (BatchDepositDto customDeposit : mBatchReport.getCustomTenderDeposits()) {
+                BigDecimal customTenderCounted, customTenderExpected, customTenderOverShort;
+                for (int i = 0; i < mContainerCustomTenders.getChildCount(); i++) {
+                    ViewGroup rowContainer = (ViewGroup)mContainerCustomTenders.getChildAt(i);
+                    if (customDeposit.getCustomTenderFields().getCustomTenderId() ==
+                            rowContainer.getTag()) {
+                        customTenderCounted = rowContainer.findViewById(R.id.tender_deposit_amount);
+                        customTenderExpected = rowContainer.findViewById(R.id.tender_total_amount);
+                        customTenderOverShort = customTenderCounted.subtract(customTenderExpected);
+                    }
+                }
+            }
+        }*/
     }
 
-    @Test
-    fun `getCustomTenderDeposits adds new custom deposit when none exists`() {
-        val report = BatchReport()
-        val tender = TxDbTender().apply {
-            paymentType = PaymentType.CustomTender
-            orderAmount = BigDecimal("5.00")
-            tipAmount = BigDecimal("1.00")
-            changeAmount = BigDecimal.ZERO
-            totalAmount = BigDecimal("6.00")
-            amountReceived = BigDecimal("6.00")
-            customFields = CustomTenderFieldsDto().apply {
-                customTenderId = 101
+    @NonNull
+    public List<BatchDepositDto> finalizeBatchDeposits(@NonNull List<BatchDepositDto> deposits) {
+        List<BatchDepositDto> finalizedDeposits = new ArrayList<>();
+
+        IdManager idManager = AppEntryPoint.get().getIdManager();
+
+        for (BatchDepositDto deposit : deposits) {
+            if (deposit == null || deposit.getPaymentType() == null) {
+                continue;
+            }
+            BatchDepositDto finalizedDeposit = new BatchDepositDto(deposit);
+            // Set Common Data
+            Date dateTime = new Date();
+            finalizedDeposit.setBatchDepositNumber(idManager.getUniqueNumber());
+            finalizedDeposit.setCreationDateTime(dateTime);
+            finalizedDeposit.setRevisionDateTime(dateTime);
+            finalizedDeposit.setCreationUserId(UserHelper.getUserId());
+            finalizedDeposit.setRevisionUserId(UserHelper.getUserId());
+            finalizedDeposit.setBatchNumber(BatchHelper.getCurrentBatchNumber());
+
+            // Set Amounts
+            switch (finalizedDeposit.getPaymentType()) {
+                case Cash:
+                    finalizedDeposit.setDepositAmount(mCashExpectedTotal.add(mCashOverShort));
+                    finalizedDeposit.setOverShortAmount(mCashOverShort);
+                    break;
+
+                case CreditCard:
+                    finalizedDeposit.setDepositAmount(mCreditReceivedTotal);
+                    finalizedDeposit.setOverShortAmount(mCreditOverShort);
+                    break;
+
+                case Check:
+                    finalizedDeposit.setDepositAmount(mCheckReceivedTotal);
+                    finalizedDeposit.setOverShortAmount(mCheckOverShort);
+                    break;
+
+                case DebitCard:
+                    finalizedDeposit.setDepositAmount(mDebitReceivedTotal);
+                    finalizedDeposit.setOverShortAmount(mDebitOverShort);
+                    break;
+
+                case EbtCard:
+                    finalizedDeposit.setDepositAmount(mEbtReceivedTotal);
+                    finalizedDeposit.setOverShortAmount(mEbtOverShort);
+                    break;
+
+                case GiftCard:
+                    finalizedDeposit.setDepositAmount(mGiftCardReceivedTotal);
+                    finalizedDeposit.setOverShortAmount(mGiftCardOverShort);
+                    break;
+
+                case GiftCertificate:
+                    finalizedDeposit.setDepositAmount(mGiftCertificateReceivedTotal);
+                    finalizedDeposit.setOverShortAmount(mGiftCertificateOverShort);
+                    break;
+
+                case CustomTender:
+                    finalizedDeposit.setDepositAmount(mCustomTenderReceivedTotal);
+                    finalizedDeposit.setOverShortAmount(mCustomTenderOverShort);
+                    break;
+            }
+
+            finalizedDeposits.add(finalizedDeposit);
+        }
+        return finalizedDeposits;
+    }
+
+    @NonNull
+    public static BatchTotals populate(@NonNull List<BatchDepositDto> deposits,
+            @NonNull List<TxDbBatchTransfer> transfers) {
+        BatchTotals totals = new BatchTotals();
+        for (BatchDepositDto deposit : deposits) {
+            if (deposit == null || deposit.getPaymentType() == null) {
+                continue;
+            }
+            switch (deposit.getPaymentType()) {
+                case CreditCard:
+                    totals.mNeedsCreditDeposit = true;
+
+                    if (deposit.getTotalAmount() != null) {
+                        totals.mCreditExpectedTotal =
+                                totals.mCreditExpectedTotal.add(deposit.getTotalAmount());
+                    }
+
+                    if (deposit.getAmountReceived() != null) {
+                        totals.mCreditReceivedTotal =
+                                totals.mCreditReceivedTotal.add(deposit.getAmountReceived());
+                    }
+                    break;
+
+                case Cash:
+                    totals.mNeedsCashDeposit = true;
+
+                    if (deposit.getTotalAmount() != null) {
+                        totals.mCashExpectedTotal =
+                                totals.mCashExpectedTotal.add(deposit.getTotalAmount());
+                    }
+
+                    if (deposit.getOrderAmount() != null) {
+                        totals.mCashReceivedTotal = deposit.getOrderAmount();
+                    }
+
+                    if (deposit.getTipAmount() != null) {
+                        totals.mCashTips = deposit.getTipAmount();
+                    }
+
+                    for (TxDbBatchTransfer transfer : transfers) {
+                        if (transfer == null || transfer.getTransferTypeId() == null) {
+                            continue;
+                        }
+                        if (!transfer.getTransferTypeId().equals(TransferType.SafeDrop)) {
+                            totals.mCashExpectedTotal =
+                                    totals.mCashExpectedTotal.add(transfer.getAmount());
+                        }
+                    }
+                    break;
+
+                case DebitCard:
+                    totals.mNeedsDebitDeposit = true;
+
+                    if (deposit.getTotalAmount() != null) {
+                        totals.mDebitExpectedTotal =
+                                totals.mDebitExpectedTotal.add(deposit.getTotalAmount());
+                    }
+
+                    if (deposit.getAmountReceived() != null) {
+                        totals.mDebitReceivedTotal =
+                                totals.mDebitReceivedTotal.add(deposit.getAmountReceived());
+                    }
+                    break;
+
+                case Check:
+                    totals.mNeedsCheckDeposit = true;
+
+                    if (deposit.getTotalAmount() != null) {
+                        totals.mCheckExpectedTotal =
+                                totals.mCheckExpectedTotal.add(deposit.getTotalAmount());
+                    }
+                    if (deposit.getAmountReceived() != null) {
+                        totals.mCheckReceivedTotal =
+                                totals.mCheckReceivedTotal.add(deposit.getAmountReceived());
+                    }
+                    break;
+
+                case GiftCertificate:
+                    totals.mNeedsGiftCertificateDeposit = true;
+
+                    if (deposit.getTotalAmount() != null) {
+                        totals.mGiftCertificateExpectedTotal =
+                                totals.mGiftCertificateExpectedTotal.add(deposit.getTotalAmount());
+                    }
+                    if (deposit.getAmountReceived() != null) {
+                        totals.mGiftCertificateReceivedTotal =
+                                totals.mGiftCertificateReceivedTotal
+                                        .add(deposit.getAmountReceived());
+                    }
+                    break;
+
+                case GiftCard:
+                    totals.mNeedsGiftCardDeposit = true;
+
+                    if (deposit.getTotalAmount() != null) {
+                        totals.mGiftCardExpectedTotal =
+                                totals.mGiftCardExpectedTotal.add(deposit.getTotalAmount());
+                    }
+
+                    if (deposit.getAmountReceived() != null) {
+                        totals.mGiftCardReceivedTotal =
+                                totals.mGiftCardReceivedTotal.add(deposit.getAmountReceived());
+                    }
+                    break;
+
+                case CustomTender:
+                    totals.mNeedsCustomTendersDeposit = true;
+
+                    if (deposit.getTotalAmount() != null) {
+                        totals.mCustomTenderExpectedTotal =
+                                totals.mCustomTenderExpectedTotal.add(deposit.getTotalAmount());
+                    }
+                    if (deposit.getAmountReceived() != null) {
+                        totals.mCustomTenderReceivedTotal =
+                                totals.mCustomTenderReceivedTotal.add(deposit.getAmountReceived());
+                    }
+                    break;
+
+                case EbtCard:
+                    totals.mNeedsEbtDeposit = true;
+
+                    if (deposit.getTotalAmount() != null) {
+                        totals.mEbtExpectedTotal =
+                                totals.mEbtExpectedTotal.add(deposit.getTotalAmount());
+                    }
+
+                    if (deposit.getAmountReceived() != null) {
+                        totals.mEbtReceivedTotal =
+                                totals.mEbtReceivedTotal.add(deposit.getAmountReceived());
+                    }
+                    break;
+
+                default:
+                    LogHelper.write(TAG, deposit.getPaymentType() + " Payment type not supported");
             }
         }
-
-        whenever(batchManager.getCustomTenderFieldsDto(any())).thenReturn(null)
-
-        useCaseTest.getCustomTenderDeposits(report, tender, "tag")
-
-        assertEquals(1, report.deposits.size)
-
-        val addedDeposits = report.deposits[0]
-
-        assertEquals(PaymentType.CustomTender, addedDeposits.paymentType)
-        assertEquals(BigDecimal("5.00"), addedDeposits.orderAmount)
-        assertEquals(BigDecimal("6.00"), addedDeposits.totalAmount)
+        return totals;
     }
-
-    @Test
-    fun `getCustomTenderDeposits merges into existing deposit when customTenderId matches`() {
-        val report = BatchReport()
-
-        val existing = BatchDepositDto().apply {
-            paymentType = PaymentType.CustomTender
-            orderAmount = BigDecimal("3.00")
-            tipAmount = BigDecimal("0.50")
-            changeAmount = BigDecimal.ZERO
-            totalAmount = BigDecimal("3.50")
-            amountReceived = BigDecimal("3.50")
-        }
-
-        report.addDeposit(existing)
-
-        val existingFields = CustomTenderFieldsDto()
-        existingFields.customTenderId = 101
-        whenever(batchManager.getCustomTenderFieldsDto(existing)).thenReturn(existingFields)
-
-        val tender = TxDbTender().apply {
-            paymentType = PaymentType.CustomTender
-            orderAmount = BigDecimal("2.00")
-            tipAmount = BigDecimal("0.25")
-            changeAmount = BigDecimal.ZERO
-            totalAmount = BigDecimal("2.25")
-            amountReceived = BigDecimal("2.25")
-            customFields = existingFields
-        }
-
-        useCaseTest.getCustomTenderDeposits(report, tender, "tag")
-
-        assertEquals(1, report.deposits.size)
-        val merged = report.deposits[0]
-
-        assertEquals(BigDecimal("5.00"), merged.orderAmount)
-        assertEquals(BigDecimal("0.75"), merged.tipAmount)
-        assertEquals(BigDecimal("5.75"), merged.totalAmount)
-    }
-
-    @Test(expected = Exception::class)
-    fun `getBatchReport rethrows exceptions from repository`() {
-        whenever(repository.getTransactionsFromBatchNumber(999L))
-            .thenThrow(RuntimeException("db fail"))
-
-        useCaseTest.getBatchReport("tag", 999L)
-    }
-
-    @Test
-    fun `generateUserTipTotal adds tip total for user`() {
-        val report = mock(BatchReport::class.java)
-        val userTipTotalMap = mock(SparseArray::class.java) as SparseArray<BigDecimal?>
-
-        whenever(report.userTipTotalMap).thenReturn(userTipTotalMap)
-        whenever(userTipTotalMap.get(42)).thenReturn(null)
-
-        val transaction = mock(TxDbTransaction::class.java)
-        whenever(transaction.userId).thenReturn(42)
-        whenever(transaction.totalTips).thenReturn(BigDecimal("15.00"))
-
-        useCaseTest.generateUserTipTotal(transaction, report)
-
-        verify(userTipTotalMap).put(42, BigDecimal("15.00"))
-    }
-
-    @Test
-    fun `removeZeroTotalDeposits removes all deposits when all are zero`() {
-        val report = BatchReport()
-        val zeroDeposit1 = BatchDepositDto().apply {
-            paymentType = PaymentType.Cash
-            totalAmount = BigDecimal.ZERO
-        }
-        val zeroDeposit2 = BatchDepositDto().apply {
-            paymentType = PaymentType.CreditCard
-            totalAmount = BigDecimal.ZERO
-        }
-        val zeroDeposit3 = BatchDepositDto().apply {
-            paymentType = PaymentType.CustomTender
-            totalAmount = BigDecimal.ZERO
-        }
-
-        report.addDeposit(zeroDeposit1)
-        report.addDeposit(zeroDeposit2)
-        report.addDeposit(zeroDeposit3)
-
-        assertEquals(3, report.deposits.size)
-
-        useCaseTest.removeZeroTotalDeposits(report)
-
-        assertEquals(0, report.deposits.size)
-    }
-
-    @Test
-    fun `removeZeroTotalDeposits handles empty deposit list`() {
-        val report = BatchReport()
-
-        assertEquals(0, report.deposits.size)
-
-        useCaseTest.removeZeroTotalDeposits(report)
-
-        assertEquals(0, report.deposits.size)
-    }
-
-    @Test
-    fun `shouldUpdateTenderCount returns false when tender type is null`() {
-        val tender = TxDbTender().apply {
-            paymentType = PaymentType.CreditCard
-            tenderCreditStatusType = TenderCreditStatusType.Authorized
-            cvmResult = CvmResult.SignatureRequired
-        }
-
-        val result = useCaseTest.shouldUpdateTenderCount(null, TenderStatusType.Completed, tender)
-
-        assertFalse(result)
-    }
-
-    @Test
-    fun `shouldUpdateTenderCount returns false for Cancelled status`() {
-        val tender = TxDbTender().apply {
-            paymentType = PaymentType.CreditCard
-            tenderCreditStatusType = TenderCreditStatusType.Authorized
-            cvmResult = CvmResult.SignatureRequired
-        }
-
-        val result = useCaseTest.shouldUpdateTenderCount(
-            TenderType.Normal,
-            TenderStatusType.Cancelled,
-            tender
-        )
-
-        assertFalse(result)
-    }
-
-    @Test
-    fun `shouldUpdateTenderCount returns false for status other than Completed or RefundedItems`() {
-        val tender = TxDbTender().apply {
-            paymentType = PaymentType.CreditCard
-            tenderCreditStatusType = TenderCreditStatusType.Authorized
-            cvmResult = CvmResult.SignatureRequired
-        }
-
-        val result = useCaseTest.shouldUpdateTenderCount(
-            TenderType.Normal,
-            TenderStatusType.Pending,
-            tender
-        )
-
-        assertFalse(result)
-    }
-
-    @Test
-    fun `shouldUpdateTenderCount returns false when status is null`() {
-        val tender = TxDbTender().apply {
-            paymentType = PaymentType.CreditCard
-            tenderCreditStatusType = TenderCreditStatusType.Authorized
-            cvmResult = CvmResult.SignatureRequired
-        }
-
-        val result = useCaseTest.shouldUpdateTenderCount(TenderType.Normal, null, tender)
-
-        assertFalse(result)
-    }
-
-    @Test
-    fun `generateDeposits returns early when tenders is null`() {
-        val report = BatchReport()
-
-        useCaseTest.generateDeposits("tag", null, report)
-
-        assertEquals(0, report.deposits.size)
-    }
-
-    @Test
-    fun `generateUserTipTotal adds tip total for user (mocked SparseArray)`() {
-            val userId = 1
-            val tipTotal = BigDecimal("5.00")
-
-            val mockSparseArray = mock<SparseArray<BigDecimal?>>()
-            whenever(mockSparseArray.get(userId)).thenReturn(null)
-            whenever(mockSparseArray.put(userId, tipTotal)).then { /* no-op */ }
-
-            val report = mock(BatchReport::class.java)
-            whenever(report.userTipTotalMap).thenReturn(mockSparseArray)
-
-            val transaction = mock(TxDbTransaction::class.java)
-            whenever(transaction.userId).thenReturn(userId)
-            whenever(transaction.totalTips).thenReturn(tipTotal)
-
-            val useCase = GetBatchSummaryListWithReportsUseCase(mock(), mock(), mock())
-            useCase.generateUserTipTotal(transaction, report)
-
-            verify(mockSparseArray).put(userId, tipTotal)
-    }
-
-    
 }
+
+
+
+
+
