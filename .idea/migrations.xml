@@ -249,3 +249,338 @@ object CountriesTable {
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.imobile3.pos.library.database.config;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
+import android.preference.PreferenceManager;
+
+import com.imobile3.pos.library.constants.ConfigDb;
+import com.imobile3.pos.library.database.table.BusinessServicesTable;
+import com.imobile3.pos.library.database.table.CountriesTable;
+import com.imobile3.pos.library.database.table.ProductsTable;
+import com.imobile3.pos.library.database.table.PackagesTable;
+import com.imobile3.pos.library.database.table.ProductPackageAssnsTable;
+import com.imobile3.pos.library.database.table.StatesTable;
+import com.imobile3.pos.library.utils.LogHelper;
+
+public class ConfigDbHelper extends SQLiteOpenHelper {
+
+    private static final String TAG = ConfigDbHelper.class.getName();
+
+    private static final String PREF_IS_DB_PRIMARY = "is_db_primary";
+
+    private static ConfigDbHelper sInstance;
+    private static String sLastDbFilepath;
+    private static SharedPreferences sSharedPrefs;
+
+    public static synchronized ConfigDbHelper getInstance(Context context) {
+        String currentDbFilepath = getCurrentDbFilepath(context);
+        if (sInstance == null
+                || sLastDbFilepath == null
+                || !sLastDbFilepath.equals(currentDbFilepath)) {
+            ConfigDbHelper lastHelper = sInstance;
+            sInstance = new ConfigDbHelper(context.getApplicationContext(), currentDbFilepath);
+            sLastDbFilepath = currentDbFilepath;
+            if (lastHelper != null
+                    && lastHelper != sInstance) {
+                lastHelper.close();
+            }
+        }
+        return sInstance;
+    }
+
+    public static boolean isCurrentDbPrimary(Context context) {
+        return getSharedPrefs(context).getBoolean(PREF_IS_DB_PRIMARY, false);
+    }
+
+    public static void setCurrentDbPrimary(Context context, boolean isPrimary) {
+        SharedPreferences.Editor editor = getSharedPrefs(context).edit();
+        editor.putBoolean(PREF_IS_DB_PRIMARY, isPrimary);
+        editor.apply();
+    }
+
+    public static String getCurrentDbFilename(Context context) {
+        return isCurrentDbPrimary(context) ? ConfigDb.FILENAME_1 : ConfigDb.FILENAME_2;
+    }
+
+    public static String getCurrentDbFilepath(Context context) {
+        return isCurrentDbPrimary(context) ? ConfigDb.FILEPATH_1 : ConfigDb.FILEPATH_2;
+    }
+
+    private ConfigDbHelper(Context context, String dbFilename) {
+        super(context, dbFilename, null, ConfigDb.VERSION);
+    }
+
+    public void resetDb() {
+        if (sInstance != null) {
+            synchronized (BaseDao.LOCK) {
+                rebuildDb(sInstance.getWritableDatabase());
+            }
+        } else {
+            LogHelper.write(TAG, "resetDb not available until DbHelper initialized");
+        }
+    }
+
+    @Override
+    public void onOpen(SQLiteDatabase db) {
+        super.onOpen(db);
+        if (!db.isReadOnly()) {
+            db.execSQL("PRAGMA foreign_keys=ON;");
+        }
+    }
+
+    @Override
+    public void onCreate(SQLiteDatabase db) {
+        db.execSQL(ConfigDb.CREATE_CATEGORIES_TABLE);
+        db.execSQL(ProductsTable.PRODUCTS.queryCreateTable());
+        db.execSQL(ConfigDb.CREATE_TAGS_TABLE);
+        db.execSQL(ConfigDb.CREATE_TAGPRODUCTASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_MODIFIERS_TABLE);
+        db.execSQL(ConfigDb.CREATE_MODIFIERSETS_TABLE);
+        db.execSQL(ConfigDb.CREATE_MODIFIERSETMODIFIERASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_MODIFIERSETPRODUCTASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_PRODUCTMODIFIERSETASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_PRODUCTTAXES_TABLE);
+        db.execSQL(ConfigDb.CREATE_DISCOUNTS_TABLE);
+        db.execSQL(ConfigDb.CREATE_DISCOUNTPRODUCTASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_PROMOTIONS_TABLE);
+        db.execSQL(ConfigDb.CREATE_PROMOTIONPRODUCTASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_SALESEVENTS_TABLE);
+        db.execSQL(ConfigDb.CREATE_SALESEVENTPROMOTIONASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_MESSAGES_TABLE);
+        db.execSQL(ConfigDb.CREATE_IDENTIFIERS_TABLE);
+        db.execSQL(ConfigDb.CREATE_STATIONS_TABLE);
+        db.execSQL(ConfigDb.CREATE_DISCOUNTUSERASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_USERS_TABLE);
+        db.execSQL(ConfigDb.CREATE_USERPERMISSIONS_TABLE);
+        db.execSQL(ConfigDb.CREATE_ROLES_TABLE);
+        db.execSQL(ConfigDb.CREATE_USERROLEASSNS_TABLE);
+        db.execSQL(ConfigDb.CREATE_CUSTOMTENDERS_TABLE);
+        db.execSQL(ConfigDb.CREATE_PREPAIDCARDRANGES_TABLE);
+        db.execSQL(ConfigDb.CREATE_ORDERTYPES_TABLE);
+        db.execSQL(ConfigDb.CREATE_TAXES_TABLE);
+        db.execSQL(ConfigDb.CREATE_VOUCHERS_TABLE);
+        db.execSQL(BusinessServicesTable.BUSINESS_SERVICES.queryCreateTable());
+        db.execSQL(CountriesTable.COUNTRIES.queryCreateTable());
+        db.execSQL(StatesTable.STATES.queryCreateTable());
+        db.execSQL(PackagesTable.PACKAGES.queryCreateTable());
+        db.execSQL(ProductPackageAssnsTable.PRODUCT_PACKAGE_ASSNS.queryCreateTable());
+    }
+
+    @Override
+    public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+        LogHelper.write(TAG, "Upgrading database from version " + oldVersion + " to " + newVersion);
+
+        if (oldVersion < 19) {
+            rebuildDb(db);
+            return;
+        }
+
+        switch (oldVersion) {
+            case 19:
+                createOrderTypeTable(db);
+            case 20:
+                db.execSQL(
+                        "ALTER TABLE STATIONS ADD COLUMN PRINTERTYPEID integer not null DEFAULT 0;");
+            case 21:
+                // Added migration, no changes into db
+            case 22:
+                // Add 'Applied to Manual Items' column to [ProductTaxes]
+                // Add 'Applied to Quick Sale Items' column to [ProductTaxes]
+                // Add 'Applied to Terminal Items' column to [ProductTaxes]
+                db.execSQL(
+                        "ALTER TABLE PRODUCTTAXES ADD COLUMN APPLIEDTOMANUALITEMS boolean not null DEFAULT 0;");
+                db.execSQL(
+                        "ALTER TABLE PRODUCTTAXES ADD COLUMN APPLIEDTOQUICKSALEITEMS boolean not null DEFAULT 0;");
+                db.execSQL(
+                        "ALTER TABLE PRODUCTTAXES ADD COLUMN APPLIEDTOTERMINALITEMS boolean not null DEFAULT 0;");
+            case 23:
+                db.execSQL(
+                        "ALTER TABLE PRODUCTTAXES ADD COLUMN ISINCLUSIVETAX boolean not null DEFAULT 0;");
+            case 24:
+                db.execSQL("ALTER TABLE PRODUCTS ADD COLUMN UNITOFMEASURE text;");
+                db.execSQL(
+                        "ALTER TABLE PRODUCTTAXES ADD COLUMN TAXTYPEID integer not null DEFAULT 0;");
+            case 25:
+                db.execSQL(
+                        "ALTER TABLE PRODUCTTAXES ADD COLUMN PRINTONRECEIPTPERITEM boolean not " +
+                                "null DEFAULT 0;");
+            case 26:
+                createTaxesTable(db);
+            case 27:
+                createVouchersTable(db);
+            case 28:
+                db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_TAXES);
+                db.execSQL(ConfigDb.CREATE_TAXES_TABLE);
+            case 29:
+                db.execSQL(BusinessServicesTable.queryCreateOriginalTableIfNotExist());
+            case 30:
+                db.execSQL(CountriesTable.queryCreateOriginalTableIfNotExist());
+                db.execSQL(StatesTable.queryCreateOriginalTableIfNotExist());
+        }
+
+        if (oldVersion < 31) {
+            /*
+             Recreate tables from previous version (v30) just in case if they don't exist. This
+             is required as we've stopped using 'switch'. The 'switch' doesn't work for cases when
+             we clean install the app which creates the database using the 'onCreate' method. Then
+             if we upgrade the app, 'switch' will start from the 'oldVersion' to do the upgrade
+             causing the 'duplicate column name' error.
+
+             Using the new approach 'if (oldVersion < 31)' will ensure that the db changes will
+             be applied regardless of whether the app was clean installed with previous version or
+             it was installed long before and it is just a subsequent upgrade.
+            */
+
+            db.execSQL(CountriesTable.queryCreateOriginalTableIfNotExist());
+            db.execSQL(StatesTable.queryCreateOriginalTableIfNotExist());
+
+            db.execSQL("ALTER TABLE COUNTRIES ADD COLUMN COUNTRYADDRESSRULES text;");
+            db.execSQL(
+                    "ALTER TABLE COUNTRIES ADD COLUMN COUNTRYSUPPORTED boolean not null DEFAULT 0;");
+        }
+        if (oldVersion < 32) {
+            db.execSQL(
+                    "ALTER TABLE DISCOUNTS ADD COLUMN ISLOYALTYREWARD boolean not null DEFAULT 0;");
+        }
+        if (oldVersion < 33) {
+            ConfigDbUpgradeHelper.upgradeDatabaseToVersion33(db);
+        }
+        if (oldVersion < 34) {
+            db.execSQL("ALTER TABLE PRODUCTS ADD COLUMN ISSERVICE boolean not null DEFAULT 0;");
+        }
+        if (oldVersion < 35) {
+            db.execSQL(
+                    "ALTER TABLE PRODUCTS ADD COLUMN SERVICEDURATION integer not null DEFAULT 0");
+        }
+        if (oldVersion < 36) {
+            db.execSQL(PackagesTable.queryCreateOriginalTableIfNotExist());
+            db.execSQL(ProductPackageAssnsTable.queryCreateOriginalTableIfNotExist());
+        }
+        if (oldVersion < 37) {
+            // next update
+        }
+    }
+
+    private void createOrderTypeTable(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS ORDERTYPES("
+                + "ORDERTYPEID integer not null, "
+                + "ACCOUNTTYPEID integer, "
+                + "NAME text, "
+                + "ISDEFAULT boolean"
+                + ");");
+    }
+
+    private void createTaxesTable(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS TAXES( "
+                + "ID integer primary key, "
+                + "NAME text not null, "
+                + "DESCRIPTION text, "
+                + "RATE text not null, "
+                + "INUSE boolean not null, "
+                + "ISACTIVE boolean not null, "
+                + "ISINCLUSIVE boolean not null, "
+                + "TAXTYPEID integer not null, "
+                + "TAXAPPLICATIONTYPEID integer not null"
+                + ");");
+    }
+
+    private void createVouchersTable(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS VOUCHERS("
+                + "ID integer primary key, "
+                + "NAME text not null, "
+                + "ISOPENMONETARYVALUE boolean not null, "
+                + "VALUE text not null, "
+                + "BARCODE text unique, "
+                + "ISSUER text, "
+                + "VOUCHERTYPE text, "
+                + "CUSTOMTENDERFIELDS text"
+                + ");");
+    }
+
+    private void rebuildDb(SQLiteDatabase db) {
+        // Drop tables in the reverse creation order to prevent breaking Foreign Key relationships
+        db.execSQL("DROP TABLE IF EXISTS " + StatesTable.getName());
+        db.execSQL("DROP TABLE IF EXISTS " + CountriesTable.getName());
+        db.execSQL("DROP TABLE IF EXISTS " + BusinessServicesTable.getName());
+        db.execSQL("DROP TABLE IF EXISTS " + ProductPackageAssnsTable.getName());
+        db.execSQL("DROP TABLE IF EXISTS " + PackagesTable.getName());
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_VOUCHERS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_TAXES);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_ORDERTYPES);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_PREPAIDCARDRANGES);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_CUSTOMTENDERS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_USERROLEASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_ROLES);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_USERPERMISSIONS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_USERS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_DISCOUNTUSERASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_STATIONS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_IDENTIFIERS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_MESSAGES);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_SALESEVENTPROMOTIONASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_SALESEVENTS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_PROMOTIONPRODUCTASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_PROMOTIONS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_DISCOUNTPRODUCTASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_DISCOUNTS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_PRODUCTTAXES);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_PRODUCTMODIFIERSETASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_MODIFIERSETPRODUCTASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_MODIFIERSETMODIFIERASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_MODIFIERSETS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_MODIFIERS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_TAGPRODUCTASSNS);
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_TAGS);
+        db.execSQL("DROP TABLE IF EXISTS " + ProductsTable.getName());
+        db.execSQL("DROP TABLE IF EXISTS " + ConfigDb.TABLE_CATEGORIES);
+        onCreate(db);
+    }
+
+    private static SharedPreferences getSharedPrefs(Context context) {
+        if (sSharedPrefs == null) {
+            sSharedPrefs = PreferenceManager.getDefaultSharedPreferences(context);
+        }
+        return sSharedPrefs;
+    }
+}
+
+
+
