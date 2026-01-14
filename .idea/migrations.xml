@@ -584,3 +584,451 @@ public class ConfigDbHelper extends SQLiteOpenHelper {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package com.imobile3.pos.library.database.transaction;
+
+import android.content.Context;
+import android.database.SQLException;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
+
+import com.imobile3.pos.library.constants.TransactionDb;
+import com.imobile3.pos.library.database.table.ItemsTable;
+import com.imobile3.pos.library.database.table.TransactionCustomersTable;
+import com.imobile3.pos.library.database.table.TransactionJournalTable;
+import com.imobile3.pos.library.utils.LogHelper;
+
+/**
+ * Checklist for creating a new table:
+ * <p>
+ * <ol>
+ * <li>Create new 'Table' class and define SQL schema using Table.kt DSL</li>
+ * <li>DROP TABLE in the {@link #resetDb()} method</li>
+ * <li>Create table in the {@link #onCreate(SQLiteDatabase)} method</li>
+ * <li>Support database upgrade path by creating table in the
+ * {@link #onUpgrade(SQLiteDatabase, int, int)} version fall-through</li>
+ * <li>Create a DAO (Data Access Object) with ContentValues mapping</li>
+ * <li>Create new instrumentation tests to validate CRUD (Create, Read,
+ * Update, Delete) operations</li>
+ * <li>Add new instrumentation test to {@code TransactionDbHelperTest} to
+ * validate the new DB version upgrade path</li>
+ * </ol>
+ */
+public class TransactionDbHelper extends SQLiteOpenHelper {
+
+    private static final String TAG = TransactionDbHelper.class.getName();
+
+    private static TransactionDbHelper sInstance;
+
+    public static synchronized TransactionDbHelper getInstance(Context context) {
+        if (sInstance == null) {
+            sInstance = new TransactionDbHelper(context.getApplicationContext());
+        }
+        return sInstance;
+    }
+
+    private TransactionDbHelper(Context context) {
+        super(context, TransactionDb.FILEPATH, null, TransactionDb.VERSION);
+    }
+
+    public void resetDb() {
+        if (sInstance != null) {
+            synchronized (BaseDao.LOCK) {
+                SQLiteDatabase db = sInstance.getWritableDatabase();
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_DISCOUNTTENDERASSNS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_FEETENDERASSNS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_FEES);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_TENDERS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_TRANSACTIONNOTES);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_DISCOUNTITEMASSNS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_DISCOUNTS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_TAXITEMASSNS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_TAXES);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_MODIFIERS);
+                db.execSQL("DROP TABLE IF EXISTS " + ItemsTable.getName());
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_TRANSACTIONS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_BATCHTRANSFERS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_BATCHNOTES);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_BATCHES);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_NOTIFICATIONS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionDb.TABLE_TRANSACTIONEVENTS);
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionCustomersTable.getName());
+                db.execSQL("DROP TABLE IF EXISTS " + TransactionJournalTable.getName());
+
+                onCreate(db);
+            }
+        } else {
+            LogHelper.write(TAG, "resetDb not available until TxDbHelper initialized");
+        }
+    }
+
+    @Override
+    public void onOpen(SQLiteDatabase db) {
+        super.onOpen(db);
+        if (!db.isReadOnly()) {
+            db.execSQL("PRAGMA foreign_keys=ON;");
+        }
+    }
+
+    @Override
+    public void onCreate(SQLiteDatabase db) {
+        db.execSQL(TransactionDb.CREATE_BATCHES_TABLE);
+        db.execSQL(TransactionDb.CREATE_BATCHNOTES_TABLE);
+        db.execSQL(TransactionDb.CREATE_BATCHTRANSFERS_TABLE);
+        db.execSQL(TransactionDb.CREATE_TRANSACTIONS_TABLE);
+        db.execSQL(ItemsTable.ITEMS.queryCreateTable());
+        db.execSQL(TransactionDb.CREATE_MODIFIERS_TABLE);
+        db.execSQL(TransactionDb.CREATE_TAXES_TABLE);
+        db.execSQL(TransactionDb.CREATE_TAXITEMASSNS_TABLE);
+        db.execSQL(TransactionDb.CREATE_DISCOUNTS_TABLE);
+        db.execSQL(TransactionDb.CREATE_DISCOUNTITEMASSNS_TABLE);
+        db.execSQL(TransactionDb.CREATE_TRANSACTIONNOTES_TABLE);
+        db.execSQL(TransactionDb.CREATE_TENDERS_TABLE);
+        db.execSQL(TransactionDb.CREATE_FEES_TABLE);
+        db.execSQL(TransactionDb.CREATE_FEETENDERASSNS_TABLE);
+        db.execSQL(TransactionDb.CREATE_DISCOUNTTENDERASSNS_TABLE);
+        db.execSQL(TransactionDb.CREATE_NOTIFICATIONS_TABLE);
+        db.execSQL(TransactionDb.CREATE_TRANSACTIONEVENTS_TABLE);
+        db.execSQL(TransactionCustomersTable.TRANSACTION_CUSTOMERS.queryCreateTable());
+        db.execSQL(TransactionJournalTable.TRANSACTION_JOURNAL.queryCreateTable());
+    }
+
+    @Override
+    public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+        LogHelper.write(TAG, "Upgrading database from version " + oldVersion + " to " + newVersion);
+
+        if (oldVersion < 54) {
+            // this is the first update to 6.15+, full reset required
+            db.execSQL("DROP TABLE IF EXISTS STATIONITEMS");
+            db.execSQL("DROP TABLE IF EXISTS STATIONTRANSACTIONS");
+            db.execSQL("DROP TABLE IF EXISTS TENDERS");
+            db.execSQL("DROP TABLE IF EXISTS TRANSACTIONS");
+            db.execSQL("DROP TABLE IF EXISTS CARTMESSAGES");
+            db.execSQL("DROP TABLE IF EXISTS CARTDISCOUNTPRODUCTASSNS");
+            db.execSQL("DROP TABLE IF EXISTS CARTDISCOUNTS");
+            db.execSQL("DROP TABLE IF EXISTS CARTPRODUCTTAXES");
+            db.execSQL("DROP TABLE IF EXISTS CARTPRODUCTMODIFIERS");
+            db.execSQL("DROP TABLE IF EXISTS CARTPRODUCTS");
+            db.execSQL("DROP TABLE IF EXISTS CARTLIST");
+            onCreate(db);
+            return;
+        }
+
+        // 1. no breaks after each case, in case user is upgrading multiple versions
+        // 2. avoid using table/column constants as we don't want to lose track of history
+        // ALTER reference: https://www.sqlite.org/lang_altertable.html
+        switch (oldVersion) {
+            case 54:
+                // add QUEUEDACTIONID column to TENDERS table (nullable)
+                db.execSQL("ALTER TABLE TENDERS ADD COLUMN QUEUEDACTIONID integer;");
+            case 55:
+                // add CUSTOMERLOYALTYID column to TRANSACTIONS table (nullable), copy existing
+                // data from CUSTOMERID into it, then clear everything from CUSTOMERID
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN CUSTOMERLOYALTYID integer;");
+                db.execSQL("UPDATE TRANSACTIONS SET CUSTOMERLOYALTYID = CUSTOMERID;");
+                db.execSQL("UPDATE TRANSACTIONS SET CUSTOMERID = NULL;");
+            case 56:
+                // add TENDERNAME column to TENDERS table (nullable)
+                // add ISCREATEDOFFLINE column to TENDERS table (not null, default to false)
+                // add ISREFUNDFROMFAILURE column to TENDERS table (nullable)
+                db.execSQL("ALTER TABLE TENDERS ADD COLUMN TENDERNAME text;");
+                db.execSQL(
+                        "ALTER TABLE TENDERS ADD COLUMN ISCREATEDOFFLINE boolean not null DEFAULT 0;");
+                db.execSQL("ALTER TABLE TENDERS ADD COLUMN ISREFUNDFROMFAILURE boolean;");
+            case 57:
+                // add TOTALFEES column to TRANSACTIONS table
+                // add TOTALFEES column to TENDERS table
+                // Add FEES table
+                // add FeeTenderAssns table
+                db.execSQL(
+                        "ALTER TABLE TRANSACTIONS ADD COLUMN TOTALFEES text not null DEFAULT '0.00';");
+                db.execSQL(
+                        "ALTER TABLE TENDERS ADD COLUMN TOTALFEES text not null DEFAULT '0.00';");
+                createFeesTable57(db);
+                createFeeTenderAssnsTable57(db);
+            case 58:
+                createDiscountTenderAssnsTable58(db);
+            case 59:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN CUSTOMFIELDS text;");
+            case 60:
+                // add CATEGORYID column to ITEMS table, copy existing
+                // data from ADDITIONALINFO (attempt to parse JSON) into it
+                db.execSQL(
+                        "ALTER TABLE ITEMS ADD COLUMN CATEGORYID integer not null DEFAULT 0;");
+                migrateCategoryIdFromAdditionalInfoJson(db);
+            case 61:
+                db.execSQL("ALTER TABLE FEES ADD COLUMN REFUNDEDAMOUNT text;");
+            case 62:
+                db.execSQL(
+                        "ALTER TABLE DISCOUNTS ADD COLUMN IGNORESDISCOUNTABLEPOLICY boolean not null DEFAULT 0;");
+            case 63:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN TENDERINFO text;");
+            case 64:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN RECEIPTSMS text;");
+                db.execSQL(
+                        "ALTER TABLE TRANSACTIONS ADD COLUMN ISSENDRECEIPTSMS boolean not null DEFAULT 0;");
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN RECEIPTSMSSENTDATETIME integer;");
+            case 65:
+                db.execSQL(
+                        "ALTER TABLE TRANSACTIONS ADD COLUMN TOTALROUNDINGAMOUNT text not null DEFAULT '0.00';");
+                db.execSQL(
+                        "ALTER TABLE TENDERS ADD COLUMN ROUNDINGAMOUNT text not null DEFAULT '0.00';");
+            case 66:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN RECEIPTLANGUAGE text;");
+            case 67:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN ORDERTYPEID integer;");
+            case 68:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN ACCEPTEDDATETIME integer;");
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN CUSTOMERNAME text;");
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN ORDERSTATUSTYPEID integer;");
+            case 69:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN RECEIPTTYPE integer;");
+            case 70:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN CUSTOMERPHONE text;");
+            case 71:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN CUSTOMERINVOICENUMBER text;");
+            case 72:
+                createNotificationTable72(db);
+            case 73:
+                db.execSQL(
+                        "ALTER TABLE NOTIFICATIONS ADD COLUMN UPLOADATTEMPTS integer not null DEFAULT 0;");
+                db.execSQL("ALTER TABLE NOTIFICATIONS ADD COLUMN METADATA text;");
+            case 74:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN INVOICEID integer;");
+            case 75:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN INVOICECUSTOMERID integer;");
+            case 76:
+                createTransactionEventsTable76(db);
+            case 77:
+                // add CATEGORYNAME column to ITEMS table, copy existing
+                // data from ADDITIONALINFO (attempt to parse JSON) into it
+                db.execSQL("ALTER TABLE ITEMS ADD COLUMN CATEGORYNAME text;");
+                migrateCategoryNameFromAdditionalInfoJson(db);
+
+                db.execSQL("ALTER TABLE ITEMS ADD COLUMN SUBCATEGORYNAME text;");
+                db.execSQL("ALTER TABLE ITEMS ADD COLUMN GROUPNAME text;");
+                db.execSQL("ALTER TABLE ITEMS ADD COLUMN DESCRIPTION text;");
+            case 78:
+                db.execSQL("ALTER TABLE TAXES ADD COLUMN ISINCLUSIVE boolean not null DEFAULT 0;");
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN TOTALINCLUSIVETAX text not null " +
+                        "DEFAULT '0.00';");
+            case 79:
+                db.execSQL("ALTER TABLE TAXITEMASSNS ADD COLUMN ISINCLUSIVE boolean not null " +
+                        "DEFAULT 0;");
+            case 80:
+                db.execSQL("ALTER TABLE ITEMS ADD COLUMN UNITOFMEASURE text;");
+            case 81:
+                db.execSQL("ALTER TABLE TAXES ADD COLUMN TAXTYPEID integer not null DEFAULT 0;");
+                db.execSQL(
+                        "ALTER TABLE TAXITEMASSNS ADD COLUMN TAXTYPEID integer not null DEFAULT 0;");
+            case 82:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN CUSTOMER text;");
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN POSCUSTOMERID integer;");
+
+            case 83:
+                db.execSQL(
+                        "ALTER TABLE ITEMS ADD COLUMN REVENUEAMOUNT text not null DEFAULT '0.00';");
+            case 84:
+                db.execSQL(
+                        "ALTER TABLE TRANSACTIONS ADD COLUMN ORIGINALTRANSACTIONSOURCETYPEID integer;");
+
+            case 85:
+                db.execSQL(TransactionCustomersTable.queryCreateOriginalTableIfNotExist());
+
+            case 86:
+                db.execSQL("ALTER TABLE BATCHTRANSFERS ADD COLUMN ISDELETED boolean not null " +
+                        "DEFAULT 0;");
+
+            case 87:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN APPONLYMETADATA text;");
+
+            case 88:
+                db.execSQL(TransactionJournalTable.queryCreateOriginalTableIfNotExist());
+
+            case 89:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN ISHANDWRITTEN boolean not null " +
+                        "DEFAULT 0;");
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN HANDWRITTENNUMBER text;");
+
+            case 90:
+                TransactionDbUpgradeHelper.upgradeDatabaseToVersion91(db);
+
+            case 91:
+                db.execSQL("ALTER TABLE TRANSACTIONS ADD COLUMN APPOINTMENTID text;");
+
+            case 92:
+                // next update
+        }
+    }
+
+    private void createFeesTable57(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE FEES (" +
+                "FEENUMBER integer unique not null, " +
+                "PARENTFEENUMBER integer, " +
+                "TRANSACTIONNUMBER integer not null, " +
+                "AMOUNT text, " +
+                "NAME text not null, " +
+                "TYPE integer not null, " +
+                "VALUETYPE integer not null, " +
+                "SETAMOUNT text, " +
+                "SETPERCENTAGE text, " +
+                "FEESTATUS integer not null, " +
+                "ISREFUNDABLE boolean not null, " +
+                "FOREIGN KEY (TRANSACTIONNUMBER) " +
+                "REFERENCES TRANSACTIONS (TRANSACTIONNUMBER) " +
+                "ON DELETE CASCADE);");
+    }
+
+    private void createFeeTenderAssnsTable57(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE FEETENDERASSNS (" +
+                "FEENUMBER integer unique not null, " +
+                "TENDERNUMBER integer not null, " +
+                "FOREIGN KEY (TENDERNUMBER) " +
+                "REFERENCES TENDERS (TENDERNUMBER) " +
+                "ON DELETE CASCADE);");
+    }
+
+    private void createDiscountTenderAssnsTable58(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE DISCOUNTTENDERASSNS (" +
+                "TENDERDISCOUNTNUMBER integer unique not null, " +
+                "PARENTTENDERDISCOUNTNUMBER integer, " +
+                "DISCOUNTNUMBER integer not null, " +
+                "TENDERNUMBER integer not null, " +
+                "AMOUNT text, " +
+                "FOREIGN KEY (DISCOUNTNUMBER) " +
+                "REFERENCES DISCOUNTS (DISCOUNTNUMBER) " +
+                "ON DELETE CASCADE, " +
+                "FOREIGN KEY (TENDERNUMBER) " +
+                "REFERENCES TENDERS (TENDERNUMBER) " +
+                "ON DELETE CASCADE);");
+    }
+
+    private void createNotificationTable72(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS NOTIFICATIONS("
+                + "ROWID integer primary key, "
+                + "REFERENCENUMBER integer not null, "
+                + "CREATIONDATETIME integer not null, "
+                + "CHANNELTYPEID integer not null, "
+                + "NOTIFICATIONTYPEID integer not null, "
+                + "CATEGORYID integer not null, "
+                + "LANGUAGECODE text not null, "
+                + "PHONE text, "
+                + "EMAIL text"
+                + ");");
+    }
+
+    private void createTransactionEventsTable76(SQLiteDatabase db) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS TRANSACTIONEVENTS("
+                + "ROWID integer primary key, "
+                + "TRANSACTIONNUMBER integer not null, "
+                + "CREATIONDATETIME integer not null, "
+                + "CATEGORYID integer not null, "
+                + "EVENTTYPEID integer not null, "
+                + "UPLOADATTEMPTS integer not null, "
+                + "METADATA text"
+                + ");");
+    }
+
+    // Code analyzer is flagging the "replace" and "else" keywords as errors.
+    // The syntax errors are generated by the injected SQL parser for Android Studio
+    // (instead of Lint). Ref: https://issuetracker.google.com/issues/68403417
+    @SuppressWarnings("SpellCheckingInspection")
+    private void migrateCategoryIdFromAdditionalInfoJson(SQLiteDatabase db) {
+        // Note: The INSTR() function was added in sqlite version 3.7.15
+        // Ref: https://www.sqlite.org/changes.html
+        /*
+        UPDATE ITEMS
+        -- Update the 'Items.CategoryId' column with the JSON 'CategoryId' values
+        SET CATEGORYID = (
+            SELECT (
+                -- Subquery: Parse the AdditionalInfo JSON column
+                -- If the AdditionalInfo is null, the 'CategoryId' will be 0
+                CASE WHEN I.ADDITIONALINFO IS NOT NULL
+                    AND INSTR(I.ADDITIONALINFO, '"CategoryId":') != 0
+                THEN SUBSTR(
+                    REPLACE(I.ADDITIONALINFO, '{"CategoryId":', ''),
+                    -- Start Index (first numeric digit)
+                    1,
+                    -- End Index (digit before the comma)
+                    INSTR(REPLACE(I.ADDITIONALINFO, '{"CategoryId":', ''), ',') - 1)
+                ELSE '0'
+                END
+            )
+            FROM ITEMS as I
+            -- 'Join' the subquery result to the outer update query on self.PrimaryKey
+            WHERE ITEMS.ITEMNUMBER = I.ITEMNUMBER
+        )
+         */
+        //@formatter:off
+        String sql =
+                "UPDATE ITEMS " +
+                "SET CATEGORYID = ( " +
+                "    SELECT ( " +
+                "        CASE WHEN I.ADDITIONALINFO IS NOT NULL " +
+                "            AND INSTR(I.ADDITIONALINFO, '\"CategoryId\":') != 0 " +
+                "        THEN SUBSTR( " +
+                "            REPLACE(I.ADDITIONALINFO, '{\"CategoryId\":', ''), " +
+                "            1, " +
+                "            INSTR(REPLACE(I.ADDITIONALINFO, '{\"CategoryId\":', ''), ',') - 1) " +
+                "        ELSE '0' " +
+                "        END " +
+                "    ) " +
+                "    FROM ITEMS AS I " +
+                "    WHERE ITEMS.ITEMNUMBER = I.ITEMNUMBER " +
+                ");";
+        //@formatter:on
+        // Collapse all extra whitespace into one space (this helps
+        // clean up SQLException stack traces)
+        sql = sql.trim().replaceAll(" +", " ");
+        try {
+            db.execSQL(sql);
+        } catch (SQLException e) {
+            LogHelper.write(TAG, e);
+        }
+    }
+
+    /**
+     * Transactions that originate from server do not send the CategoryName in the Item's
+     * AdditionalInfo field which is why a migration is necessary. This new method will
+     * migrate the CategoryName found in the {@link TransactionDb#COLUMN_ITEMS_ADDITIONALINFO}
+     * column which is a JSON string and save it to {@link TransactionDb#COLUMN_ITEMS_CATEGORYNAME}.
+     */
+    @SuppressWarnings("SpellCheckingInspection")
+    private void migrateCategoryNameFromAdditionalInfoJson(SQLiteDatabase db) {
+        String sql = TransactionDbHelperUtils.setItemsCategoryNameFromAdditionalInfo();
+        try {
+            db.execSQL(sql);
+        } catch (SQLException e) {
+            LogHelper.write(TAG, e);
+        }
+    }
+}
+
