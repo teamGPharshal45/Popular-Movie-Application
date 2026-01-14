@@ -1,10 +1,251 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="ProjectMigrations">
-    <option name="MigrateToGradleLocalJavaHome">
-      <set>
-        <option value="$PROJECT_DIR$" />
-      </set>
-    </option>
-  </component>
-</project>
+package com.imobile3.pos.library.database.table
+
+import com.imobile3.pos.library.constants.TransactionDb
+import com.imobile3.pos.library.database.schema.table
+import com.imobile3.pos.library.database.transaction.TransactionDbHelper
+
+object ItemsTable {
+
+    const val COLUMN_ITEMS_ITEMNUMBER = "ITEMNUMBER"
+    const val COLUMN_ITEMS_PARENTITEMNUMBER = "PARENTITEMNUMBER"
+    const val COLUMN_ITEMS_TRANSACTIONNUMBER = "TRANSACTIONNUMBER"
+    const val COLUMN_ITEMS_CREATIONDATETIME = "CREATIONDATETIME"
+    const val COLUMN_ITEMS_CREATIONUSERID = "CREATIONUSERID"
+    const val COLUMN_ITEMS_REVISIONDATETIME = "REVISIONDATETIME"
+    const val COLUMN_ITEMS_REVISIONUSERID = "REVISIONUSERID"
+    const val COLUMN_ITEMS_QUANTITY = "QUANTITY"
+
+    @Deprecated(
+        message = "since Transaction DB version 91. Use COLUMN_ITEMS_METADATA instead.",
+        replaceWith = ReplaceWith(
+            expression = "COLUMN_ITEMS_METADATA",
+            imports = [
+                "com.imobile3.pos.library.database.table.ItemsTable.COLUMN_ITEMS_METADATA"
+            ]
+        ),
+        level = DeprecationLevel.WARNING
+    )
+    const val COLUMN_ITEMS_ISALLOWPARTIAL = "ISALLOWPARTIAL"
+
+    const val COLUMN_ITEMS_REFUNDEDQUANTITY = "REFUNDEDQUANTITY"
+    const val COLUMN_ITEMS_INVENTORYID = "INVENTORYID"
+    const val COLUMN_ITEMS_CATEGORYID = "CATEGORYID"
+    const val COLUMN_ITEMS_CATEGORYNAME = "CATEGORYNAME"
+    const val COLUMN_ITEMS_SUBCATEGORYNAME = "SUBCATEGORYNAME"
+    const val COLUMN_ITEMS_GROUPNAME = "GROUPNAME"
+    const val COLUMN_ITEMS_DESCRIPTION = "DESCRIPTION"
+    const val COLUMN_ITEMS_PRODUCTCODE = "PRODUCTCODE"
+    const val COLUMN_ITEMS_PARTNUMBER = "PARTNUMBER"
+    const val COLUMN_ITEMS_TITLE = "TITLE"
+    const val COLUMN_ITEMS_UNITPRICE = "UNITPRICE"
+    const val COLUMN_ITEMS_REVENUEAMOUNT = "REVENUEAMOUNT"
+    const val COLUMN_ITEMS_UNITOFMEASURE = "UNITOFMEASURE"
+
+    @Deprecated(
+        message = "since Transaction DB version 91. Use COLUMN_ITEMS_METADATA instead.",
+        replaceWith = ReplaceWith(
+            expression = "COLUMN_ITEMS_METADATA",
+            imports = [
+                "com.imobile3.pos.library.database.table.ItemsTable.COLUMN_ITEMS_METADATA"
+            ]
+        ),
+        level = DeprecationLevel.WARNING
+    )
+    const val COLUMN_ITEMS_ISDISCOUNTABLE = "ISDISCOUNTABLE"
+
+    @Deprecated(
+        message = "since Transaction DB version 91. Use COLUMN_ITEMS_METADATA instead.",
+        replaceWith = ReplaceWith(
+            expression = "COLUMN_ITEMS_METADATA",
+            imports = [
+                "com.imobile3.pos.library.database.table.ItemsTable.COLUMN_ITEMS_METADATA"
+            ]
+        ),
+        level = DeprecationLevel.WARNING
+    )
+    const val COLUMN_ITEMS_ISGIFTCARD = "ISGIFTCARD"
+
+    const val COLUMN_ITEMS_ADDITIONALINFO = "ADDITIONALINFO"
+    const val COLUMN_ITEMS_PRINTSTATIONID = "PRINTSTATIONID"
+    const val COLUMN_ITEMS_PRINTDATETIME = "PRINTDATETIME"
+    const val COLUMN_ITEMS_COMMENTS = "COMMENTS"
+    const val COLUMN_ITEMS_METADATA = "METADATA"
+    const val COLUMN_ITEMS_COST = "COST"
+
+    @Deprecated(
+        message = "since Transaction DB version 91. Use COLUMN_ITEMS_METADATA instead.",
+        replaceWith = ReplaceWith(
+            expression = "COLUMN_ITEMS_METADATA",
+            imports = [
+                "com.imobile3.pos.library.database.table.ItemsTable.COLUMN_ITEMS_METADATA"
+            ]
+        ),
+        level = DeprecationLevel.WARNING
+    )
+    const val COLUMN_ITEMS_ISTRACKABLE = "ISTRACKABLE"
+
+    /**
+     * The Items db table. This is the first version of the table used when it was first
+     * created in the [TransactionDbHelper.onUpgrade].
+     */
+    private val ITEMS_ORIGINAL = table {
+
+        name = "ITEMS"
+
+        columns {
+            integer(name = COLUMN_ITEMS_ITEMNUMBER, isUnique = true, isNullable = false)
+            integer(name = COLUMN_ITEMS_PARENTITEMNUMBER, isNullable = true)
+            integer(name = COLUMN_ITEMS_TRANSACTIONNUMBER, isNullable = false)
+            integer(name = COLUMN_ITEMS_CREATIONDATETIME, isNullable = false)
+            integer(name = COLUMN_ITEMS_CREATIONUSERID, isNullable = false)
+            integer(name = COLUMN_ITEMS_REVISIONDATETIME, isNullable = false)
+            integer(name = COLUMN_ITEMS_REVISIONUSERID, isNullable = false)
+            text(name = COLUMN_ITEMS_QUANTITY, isNullable = false)
+            text(name = COLUMN_ITEMS_REFUNDEDQUANTITY, isNullable = true)
+            integer(name = COLUMN_ITEMS_INVENTORYID, isNullable = true)
+
+            /**
+             * The `CATEGORYID` column is given a default value of '0' to maintain
+             * consistency between new and upgraded databases. This matches the logic in
+             * [TransactionDbHelper.onUpgrade] (see case 60), where the `CATEGORYID` column
+             * is added with a default value.
+             * Setting a default ensures that all rows, whether created in a fresh install or after
+             * an upgrade, have a consistent initial value and prevents null or inconsistent data
+             * in this column.
+             */
+            integer(name = COLUMN_ITEMS_CATEGORYID, isNullable = false, defaultValue = "0")
+            text(name = COLUMN_ITEMS_CATEGORYNAME, isNullable = true)
+            text(name = COLUMN_ITEMS_SUBCATEGORYNAME, isNullable = true)
+            text(name = COLUMN_ITEMS_GROUPNAME, isNullable = true)
+            text(name = COLUMN_ITEMS_DESCRIPTION, isNullable = true)
+            text(name = COLUMN_ITEMS_PRODUCTCODE, isNullable = true)
+            text(name = COLUMN_ITEMS_PARTNUMBER, isNullable = true)
+            text(name = COLUMN_ITEMS_TITLE, isNullable = false)
+            text(name = COLUMN_ITEMS_UNITPRICE, isNullable = false)
+
+            /**
+             * The `REVENUEAMOUNT` column is given a default value of '0.00' to maintain
+             * consistency between new and upgraded databases. This matches the logic in
+             * [TransactionDbHelper.onUpgrade] (see case 83), where the `REVENUEAMOUNT` column
+             * is added with a default value.
+             * Setting a default ensures that all rows, whether created in a fresh install or after
+             * an upgrade, have a consistent initial value and prevents null or inconsistent data
+             * in this column.
+             */
+            text(name = COLUMN_ITEMS_REVENUEAMOUNT, isNullable = false, defaultValue = "'0.00'")
+            text(name = COLUMN_ITEMS_UNITOFMEASURE, isNullable = true)
+            text(name = COLUMN_ITEMS_ADDITIONALINFO, isNullable = true)
+            integer(name = COLUMN_ITEMS_PRINTSTATIONID, isNullable = true)
+            integer(name = COLUMN_ITEMS_PRINTDATETIME, isNullable = true)
+            text(name = COLUMN_ITEMS_COMMENTS, isNullable = true)
+            text(name = COLUMN_ITEMS_METADATA, isNullable = true)
+            text(name = COLUMN_ITEMS_COST, isNullable = true)
+        }
+
+        foreignKey {
+            columnName = COLUMN_ITEMS_TRANSACTIONNUMBER
+            referenceTable = TransactionDb.TABLE_TRANSACTIONS
+            referenceColumn = TransactionDb.COLUMN_TRANSACTIONS_TRANSACTIONNUMBER
+            onDeleteCascade = true
+        }
+    }
+
+    /**
+     * Copies columns from the [ITEMS_ORIGINAL] table and adds new ones.
+     * Use this table if you need the latest and most updated version.
+     */
+    @JvmField
+    val ITEMS = table(ITEMS_ORIGINAL) {
+
+        columns {
+            // Uncomment when new columns need to be added.
+            // integer(name = "NEWCOLUMN", isNullable = false)
+        }
+    }
+
+    @JvmStatic
+    fun queryCreateOriginalTableIfNotExist(): String {
+        return ITEMS_ORIGINAL.queryCreateTableIfNotExist()
+    }
+
+    /**
+     * Creates a temporary table with the same schema as the [ITEMS_ORIGINAL] table.
+     *
+     * @param tempTableName The name of the temporary table to create.
+     */
+    @JvmStatic
+    fun createTemporaryTableV91(tempTableName: String): String {
+        // Create a temporary table object based on the original schema
+        val tempTable = ITEMS_ORIGINAL.copy().apply { name = tempTableName }
+
+        // Generate the SQL query to create the temporary table
+        return tempTable.queryCreateTableIfNotExist()
+    }
+
+    @JvmStatic
+    val name = ITEMS.name
+
+    @JvmStatic
+    val columnsOriginal = ITEMS_ORIGINAL.columnNamesArray()
+}
+
+
+package com.imobile3.pos.library.database.table
+
+import com.imobile3.pos.library.database.config.ConfigDbHelper
+import com.imobile3.pos.library.database.schema.Column
+import com.imobile3.pos.library.database.schema.table
+
+object CountriesTable {
+
+    const val COUNTRY_ID = "COUNTRYID"
+    const val NAME = Column.NAME
+    const val ISO2 = "ISO2"
+    const val COUNTRY_PHONE_CODE = "COUNTRYPHONECODE"
+    const val COUNTRY_ADDRESS_RULES = "COUNTRYADDRESSRULES"
+    const val COUNTRY_SUPPORTED = "COUNTRYSUPPORTED"
+
+    /**
+     * The Countries db table. This is the first version of the table used when it was first
+     * created in the [ConfigDbHelper.onUpgrade].
+     */
+    private val COUNTRIES_ORIGINAL = table {
+
+        name = "COUNTRIES"
+
+        columns {
+            id(name = COUNTRY_ID)
+            text(name = NAME, isNullable = false)
+            text(name = ISO2, isNullable = false)
+            text(name = COUNTRY_PHONE_CODE, isNullable = false)
+        }
+    }
+
+    /**
+     * Copies columns from the original table and adds new ones.
+     * Use this table if you need the latest and most updated version.
+     */
+    @JvmField
+    val COUNTRIES = table(COUNTRIES_ORIGINAL) {
+
+        columns {
+            // Add new columns here that should be added to the original
+            // table columns and will be used in `ConfigDbHelper.onCreate`.
+
+            text(name = COUNTRY_ADDRESS_RULES, isPrimaryKey = false, isNullable = true)
+            boolean(name = COUNTRY_SUPPORTED, isPrimaryKey = false, isNullable = false)
+        }
+    }
+
+    @JvmStatic
+    fun queryCreateOriginalTableIfNotExist() =
+        COUNTRIES_ORIGINAL.queryCreateTableIfNotExist()
+
+    @JvmStatic
+    val name = COUNTRIES.name
+
+    @JvmStatic
+    val columns = CountriesTable.COUNTRIES.columnNamesArray()
+}
+
+
