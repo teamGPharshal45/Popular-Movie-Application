@@ -1,88 +1,45 @@
 package com.imobile3.pos.data.datasync.usecase
 
 import androidx.annotation.WorkerThread
-import com.imobile3.pos.app.constants.enums.DataSyncResult
 import com.imobile3.pos.data.datasync.DataSyncPayload
 import com.imobile3.pos.data.datasync.DataSyncResponse
+import com.imobile3.pos.data.datasync.DataSyncRepository
+import com.imobile3.pos.library.domainobjects.Response
+import com.imobile3.pos.library.webservices.transferobjects.invoice.DemographicResponseDto
 import javax.inject.Inject
 
-class DataSyncUseCases @Inject constructor(
-    private val syncTimeclockShiftsUseCase: SyncTimeclockShiftsUseCase,
-    private val syncDemographicsUseCase: SyncDemographicsUseCase,
-    private val syncVouchersUseCase: SyncVouchersUseCase,
-    private val syncBusinessService: SyncBusinessServicesUseCase,
-    private val syncLegalUrlsUseCase: SyncLegalUrlsUseCase,
-    private val syncLocationFiscalConfigurationsUseCase: SyncLocationFiscalConfigurationsUseCase,
-    private val syncPackagesUseCase: SyncPackagesUseCase
-) {
-
-    private var callback: DataSyncUseCasesCallback? = null
-    private var fullSyncResult: DataSyncResult = DataSyncResult.Complete
-    private val provisionReportFromUseCases = StringBuilder()
-
-    interface DataSyncUseCasesCallback {
-        fun updateProgress(progressCount: Int)
-    }
+class SyncDemographicsUseCase @Inject constructor(
+    private val repo: DataSyncRepository
+) : BaseDataSyncUseCase("SyncDemographicsUseCase") {
 
     @WorkerThread
-    fun execute(payload: DataSyncPayload): DataSyncResponse {
-        this.callback = payload.callback
+    override fun execute(payload: DataSyncPayload): DataSyncResponse {
+        super.execute(payload)
 
-        // TODO: Uncomment when ready to use these use cases
-        //        handleResponse(syncTimeclockShiftsUseCase.execute(payload))
-        handleResponse(syncDemographicsUseCase.execute(payload))
-        //        handleResponse(syncVouchersUseCase.execute(payload))
-
-        handleResponse(syncBusinessService.execute(payload))
-        handleResponse(syncLegalUrlsUseCase.execute(payload))
-        handleResponse(syncLocationFiscalConfigurationsUseCase.execute(payload))
-        handleResponse(syncPackagesUseCase.execute(payload))
-
-        this.callback = null
-        return DataSyncResponse(
-            dataSyncResult = fullSyncResult,
-            provisionReport = provisionReportFromUseCases.toString()
+        return fetchData(
+            startRequest = { repo.getDemographics() },
+            handleResponse = { handleResponse(it) }
         )
     }
 
-    private fun handleResponse(response: DataSyncResponse) {
-        // Append all individual reports for each use case.
-        // Eg. "SyncDemographicsUseCase: Complete / Time: 0.218s"
-        provisionReportFromUseCases.append(response.provisionReport)
+    @WorkerThread
+    private fun handleResponse(response: Response<DemographicResponseDto?>): DataSyncResponse {
+        val responseDto = response.dto ?: return onSyncNullResponse()
 
-        // Updates the full sync result if necessary.
-        updateFullSyncResult(response.dataSyncResult)
-    }
+        return try {
+            // Insert response into DB
+            responseDto.states?.let {
+                repo.insertStates(it)
+                addProgress(it.size)
+            }
 
-    /**
-     * Updates [fullSyncResult] value based on the [result] for each sync use case.
-     * Certain results take higher priority and will only update if necessary.
-     */
-    private fun updateFullSyncResult(result: DataSyncResult) {
-        if (result == DataSyncResult.Error) {
-            // Invalid authtoken/register take higher priority
-            if (fullSyncResult != DataSyncResult.InvalidAuthToken
-                && fullSyncResult != DataSyncResult.InvalidRegister
-                && fullSyncResult != DataSyncResult.AccountInactive
-                && fullSyncResult != DataSyncResult.LocationInactive
-            ) {
-                fullSyncResult = result
+            responseDto.countries?.let {
+                repo.insertCountries(it)
+                addProgress(it.size)
             }
-        } else if (result == DataSyncResult.InvalidAuthToken) {
-            // Invalid register takes higher priority
-            if (fullSyncResult != DataSyncResult.InvalidRegister
-                && fullSyncResult != DataSyncResult.AccountInactive
-                && fullSyncResult != DataSyncResult.LocationInactive
-            ) {
-                fullSyncResult = result
-            }
-        } else if (result == DataSyncResult.InvalidRegister
-            || result == DataSyncResult.AccountInactive
-            || result == DataSyncResult.LocationInactive
-        ) {
-            fullSyncResult = result
-        } else if (result == DataSyncResult.Cancelled) {
-            fullSyncResult = result
+            onSyncComplete()
+        } catch (e: Exception) {
+            onSyncException(e)
         }
     }
 }
