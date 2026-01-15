@@ -1,15 +1,45 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
-local.properties
+package com.imobile3.pos.data.datasync.usecase
+
+import androidx.annotation.WorkerThread
+import com.imobile3.pos.data.datasync.DataSyncPayload
+import com.imobile3.pos.data.datasync.DataSyncResponse
+import com.imobile3.pos.data.datasync.DataSyncRepository
+import com.imobile3.pos.library.domainobjects.Response
+import com.imobile3.pos.library.webservices.transferobjects.invoice.DemographicResponseDto
+import javax.inject.Inject
+
+class SyncDemographicsUseCase @Inject constructor(
+    private val repo: DataSyncRepository
+) : BaseDataSyncUseCase("SyncDemographicsUseCase") {
+
+    @WorkerThread
+    override fun execute(payload: DataSyncPayload): DataSyncResponse {
+        super.execute(payload)
+
+        return fetchData(
+            startRequest = { repo.getDemographics() },
+            handleResponse = { handleResponse(it) }
+        )
+    }
+
+    @WorkerThread
+    private fun handleResponse(response: Response<DemographicResponseDto?>): DataSyncResponse {
+        val responseDto = response.dto ?: return onSyncNullResponse()
+
+        return try {
+            // Insert response into DB
+            responseDto.states?.let {
+                repo.insertStates(it)
+                addProgress(it.size)
+            }
+
+            responseDto.countries?.let {
+                repo.insertCountries(it)
+                addProgress(it.size)
+            }
+            onSyncComplete()
+        } catch (e: Exception) {
+            onSyncException(e)
+        }
+    }
+}
