@@ -1,45 +1,3408 @@
-package com.imobile3.pos.data.datasync.usecase
+package com.imobile3.pos.data.datasync;
 
-import androidx.annotation.WorkerThread
-import com.imobile3.pos.data.datasync.DataSyncPayload
-import com.imobile3.pos.data.datasync.DataSyncResponse
-import com.imobile3.pos.data.datasync.DataSyncRepository
-import com.imobile3.pos.library.domainobjects.Response
-import com.imobile3.pos.library.webservices.transferobjects.invoice.DemographicResponseDto
-import javax.inject.Inject
+import android.content.Context;
+import android.text.TextUtils;
 
-class SyncDemographicsUseCase @Inject constructor(
-    private val repo: DataSyncRepository
-) : BaseDataSyncUseCase("SyncDemographicsUseCase") {
+import androidx.annotation.CallSuper;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.annotation.StringRes;
+import androidx.annotation.WorkerThread;
+import androidx.core.content.ContextCompat;
+import androidx.fragment.app.FragmentActivity;
 
-    @WorkerThread
-    override fun execute(payload: DataSyncPayload): DataSyncResponse {
-        super.execute(payload)
+import com.imobile3.pos.MainApplication;
+import com.imobile3.pos.R;
+import com.imobile3.pos.app.CrashReportingHelper;
+import com.imobile3.pos.app.constants.Defaults;
+import com.imobile3.pos.app.constants.Hardware;
+import com.imobile3.pos.app.constants.Ids;
+import com.imobile3.pos.app.constants.PrefKeys;
+import com.imobile3.pos.app.constants.enums.DataSyncResult;
+import com.imobile3.pos.app.services.SyncServiceHelper;
+import com.imobile3.pos.audits.constants.enums.AuditLevel;
+import com.imobile3.pos.data.InMemoryDataContainer;
+import com.imobile3.pos.data.async.BaseWebAsyncTask;
+import com.imobile3.pos.data.async.shift.ShiftUploadHelper;
+import com.imobile3.pos.data.audit.LogEventHelper;
+import com.imobile3.pos.data.datasync.usecase.DataSyncUseCases;
+import com.imobile3.pos.data.datasync.usecase.SeedNumberGeneratorUseCase;
+import com.imobile3.pos.data.di.AppEntryPoint;
+import com.imobile3.pos.data.flavor.FlavorHelper;
+import com.imobile3.pos.data.module.account.config.AccountConfig;
+import com.imobile3.pos.data.module.account.ProviderConfigHelper;
+import com.imobile3.pos.data.module.account.config.AgencyConfigHelper;
+import com.imobile3.pos.data.module.account.config.AgencyFeatures;
+import com.imobile3.pos.data.module.register.AgencyRegisterTemplateHelper;
+import com.imobile3.pos.data.module.account.RuntimeConfigHelper;
+import com.imobile3.pos.data.module.account.config.AccountConfigHelper;
+import com.imobile3.pos.data.module.account.config.LegacyPrefTransferHelper;
+import com.imobile3.pos.data.module.batch.BatchHelper;
+import com.imobile3.pos.data.module.customer.model.AddressFieldRule;
+import com.imobile3.pos.data.module.customer.model.AddressFormatter;
+import com.imobile3.pos.data.module.customer.model.CustomerAddress;
+import com.imobile3.pos.data.module.customer.model.CustomerAddressKt;
+import com.imobile3.pos.data.module.order.ProgramTypeHelper;
+import com.imobile3.pos.data.module.order.cart.extensions.CartObjectExtensions;
+import com.imobile3.pos.data.module.order.cart.tender.TenderReasonHelper;
+import com.imobile3.pos.data.peripherals.CfdHelper;
+import com.imobile3.pos.data.peripherals.HardwareSettingsHelper;
+import com.imobile3.pos.data.peripherals.ScannerHelper;
+import com.imobile3.pos.data.peripherals.accessorydisplay.AccessoryDisplayHelper;
+import com.imobile3.pos.data.peripherals.printer.PrinterHelper;
+import com.imobile3.pos.data.peripherals.printer.StationHelper;
+import com.imobile3.pos.data.peripherals.terminal.TerminalHelper;
+import com.imobile3.pos.data.preferences.PrefHelper;
+import com.imobile3.pos.library.constants.ConfigDb;
+import com.imobile3.pos.library.database.config.ConfigDbHelper;
+import com.imobile3.pos.library.database.config.accessObjects.CategoriesDao;
+import com.imobile3.pos.library.database.config.accessObjects.ConstantsDao;
+import com.imobile3.pos.library.database.config.accessObjects.CustomTendersDao;
+import com.imobile3.pos.library.database.config.accessObjects.DiscountsDao;
+import com.imobile3.pos.library.database.config.accessObjects.IdentifiersDao;
+import com.imobile3.pos.library.database.config.accessObjects.MessagesDao;
+import com.imobile3.pos.library.database.config.accessObjects.ModifierSetModifierAssnsDao;
+import com.imobile3.pos.library.database.config.accessObjects.ModifierSetProductAssnsDao;
+import com.imobile3.pos.library.database.config.accessObjects.ModifierSetsDao;
+import com.imobile3.pos.library.database.config.accessObjects.ModifiersDao;
+import com.imobile3.pos.library.database.config.accessObjects.ProductModifierSetAssnsDao;
+import com.imobile3.pos.library.database.config.accessObjects.ProductTaxesDao;
+import com.imobile3.pos.library.database.config.accessObjects.ProductsDao;
+import com.imobile3.pos.library.database.config.accessObjects.PromotionsDao;
+import com.imobile3.pos.library.database.config.accessObjects.RolesDao;
+import com.imobile3.pos.library.database.config.accessObjects.StationsDao;
+import com.imobile3.pos.library.database.config.accessObjects.TagProductAssnsDao;
+import com.imobile3.pos.library.database.config.accessObjects.TagsDao;
+import com.imobile3.pos.library.database.config.accessObjects.TaxesDao;
+import com.imobile3.pos.library.database.config.accessObjects.UserRoleAssnsDao;
+import com.imobile3.pos.library.database.config.accessObjects.UsersDao;
+import com.imobile3.pos.library.database.config.accessObjects.VouchersDao;
+import com.imobile3.pos.library.domainobjects.CartObject;
+import com.imobile3.pos.library.domainobjects.Response;
+import com.imobile3.pos.library.utils.FileHelper;
+import com.imobile3.pos.library.utils.LogHelper;
+import com.imobile3.pos.library.webservices.WebServices;
+import com.imobile3.pos.library.webservices.enums.AccountType;
+import com.imobile3.pos.library.webservices.enums.AvsType;
+import com.imobile3.pos.library.webservices.enums.GatewayGiftCardCapabilities;
+import com.imobile3.pos.library.webservices.enums.GlyphType;
+import com.imobile3.pos.library.webservices.enums.HttpStatusCode;
+import com.imobile3.pos.library.webservices.enums.LegalUrlType;
+import com.imobile3.pos.library.webservices.enums.LoyaltyLookUpType;
+import com.imobile3.pos.library.webservices.enums.LoyaltyProviderType;
+import com.imobile3.pos.library.webservices.enums.MerchantAccountType;
+import com.imobile3.pos.library.webservices.enums.PaymentCardType;
+import com.imobile3.pos.library.webservices.enums.PaymentType;
+import com.imobile3.pos.library.webservices.enums.ReceiptType;
+import com.imobile3.pos.library.webservices.enums.ShiftStatusType;
+import com.imobile3.pos.library.webservices.enums.TipMethod;
+import com.imobile3.pos.library.webservices.expanders.AccountLocationResponseExpander;
+import com.imobile3.pos.library.webservices.expanders.DiscountResponseExpander;
+import com.imobile3.pos.library.webservices.expanders.RegisterExpander;
+import com.imobile3.pos.library.webservices.expanders.UserListResponseExpander;
+import com.imobile3.pos.library.webservices.filters.PagingFilter;
+import com.imobile3.pos.library.webservices.transferobjects.AccountLocationResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.AgencyRegisterTemplateDto;
+import com.imobile3.pos.library.webservices.transferobjects.AgencyResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.BaseDto;
+import com.imobile3.pos.library.webservices.transferobjects.CategoryListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.ConstantsDto;
+import com.imobile3.pos.library.webservices.transferobjects.CustomTenderFieldsDto;
+import com.imobile3.pos.library.webservices.transferobjects.CustomTenderListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.CustomTransactionFieldsDto;
+import com.imobile3.pos.library.webservices.transferobjects.DiscountProductAssnListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.DiscountResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.IdentifierListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.LegalUrlsDto;
+import com.imobile3.pos.library.webservices.transferobjects.LoyaltyProgramDto;
+import com.imobile3.pos.library.webservices.transferobjects.ManualItemTaxListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.MessageListDto;
+import com.imobile3.pos.library.webservices.transferobjects.ModifierListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.ModifierSetAllAssnResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.ModifierSetListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.OnlineOrderingLocationResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.OrderEntryTagListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.OrderEntryTagProductAssnListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.OrderEntryTagResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.OrderTypeDto;
+import com.imobile3.pos.library.webservices.transferobjects.ProductListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.ProductModifierSetAssnListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.ProductTaxListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.ProductTaxResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.ProgramTypeDto;
+import com.imobile3.pos.library.webservices.transferobjects.ProgramTypeListDto;
+import com.imobile3.pos.library.webservices.transferobjects.PromotionListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.PromotionProductAssnListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.RegisterHardwareListDto;
+import com.imobile3.pos.library.webservices.transferobjects.RegisterResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.RoleListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.SalesEventListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.SalesEventPromotionAssnListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.StationDto;
+import com.imobile3.pos.library.webservices.transferobjects.StationListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.StatusResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.TimeClockConfigurationResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.UserListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.invoice.InvoicingLocationResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.tax.TaxListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.v3.ProviderConfigListResponseDto;
+import com.imobile3.pos.library.webservices.transferobjects.voucher.VoucherDto;
+import com.imobile3.pos.library.webservices.transferobjects.voucher.VoucherListResponseDto;
+import com.imobile3.pos.library.webservices.utils.GsonHelper;
+import com.imobile3.pos.timeclock.constants.TimeclockDb;
+import com.imobile3.pos.timeclock.constants.enums.ShiftRecordStatus;
+import com.imobile3.pos.timeclock.database.accessObjects.ShiftsDao;
+import com.imobile3.pos.timeclock.domainobjects.Shift;
+import com.imobile3.pos.timeclock.webservices.TimeClockWebServices;
+import com.imobile3.pos.timeclock.webservices.filters.TimeClockShiftFilter;
+import com.imobile3.pos.timeclock.webservices.transferobjects.ShiftDto;
+import com.imobile3.pos.timeclock.webservices.transferobjects.ShiftListDto;
+import com.imobile3.pos.ui.ResourceHelper;
+import com.imobile3.pos.ui.register.setup.usecase.GetAddressRulesByCountryUseCase;
 
-        return fetchData(
-            startRequest = { repo.getDemographics() },
-            handleResponse = { handleResponse(it) }
-        )
+import org.joda.time.DateTime;
+import org.joda.time.DateTimeZone;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+
+import dagger.hilt.EntryPoint;
+import dagger.hilt.InstallIn;
+import dagger.hilt.android.EntryPointAccessors;
+import dagger.hilt.components.SingletonComponent;
+
+public class DataSyncTask extends BaseWebAsyncTask<Void, String, DataSyncResult> {
+
+    private static final String TAG = "DataSyncTask";
+    private static final MainApplication APP = MainApplication.getInstance();
+    private static final int MAX_ATTEMPTS = 5;
+
+    private static final AtomicBoolean IS_RUNNING = new AtomicBoolean(false);
+
+    /**
+     * Used when the data sync process is cancelled. The <b>IS_RUNNING</b> boolean flag may
+     * still be "true" for a few milliseconds or even seconds until all IO requests are cancelled
+     * and closed.
+     */
+    private static boolean sIsCancelled;
+
+    private final boolean mForceSync;
+    private final int mAccountId;
+    private final int mAccountLocationId;
+
+    private int mNewSyncVersion;
+    private String mReceiptImageUrl;
+
+    private List<BaseRunner> mRunners;
+
+    /**
+     * Keeps track of the overall progress while syncing use cases.
+     */
+    private int useCasesTotalProgress = 0;
+
+    AccountConfig accountConfig = AppEntryPoint.get().getAccountConfig();
+    AgencyFeatures agencyFeatures = AppEntryPoint.get().getAgencyFeatures();
+
+    /**
+     * Allows dependency injection in classes not supported by Hilt.
+     */
+    @EntryPoint
+    @InstallIn(SingletonComponent.class)
+    public interface DataSyncUseCasesEntryPoint {
+        DataSyncUseCases getDataSyncUseCases();
+        GetAddressRulesByCountryUseCase getAddressRulesByCountryUseCase();
+        SeedNumberGeneratorUseCase getSeedNumberGeneratorUseCase();
     }
 
+    private static DataSyncUseCasesEntryPoint getEntryPoint() {
+        return EntryPointAccessors.fromApplication(APP, DataSyncUseCasesEntryPoint.class);
+    }
+
+    protected DataSyncTask(FragmentActivity activity, boolean forceSync) {
+        super(activity);
+
+        mForceSync = forceSync;
+
+        mAccountId = AccountConfigHelper.getAccountId();
+        mAccountLocationId = AccountConfigHelper.getAccountLocationId();
+    }
+
+    public static boolean isRunning() {
+        return IS_RUNNING.get();
+    }
+
+    public static void cancel() {
+        sIsCancelled = true;
+    }
+
+    /**
+     * Resets the <b>DataSyncTask</b> flags to their initial state if it was cancelled.
+     * The <b>Cancel</b> operation can be initiated either by the user or silently in background
+     * when the host activity is destroyed.
+     *
+     * @return True if the DataSyncTask has been cancelled and reset.
+     */
+    private static boolean wasDataSyncCancelled() {
+        if (sIsCancelled) {
+            sIsCancelled = false;
+            IS_RUNNING.set(false);
+            LogHelper.write(TAG, "DataSyncTask has been cancelled and reset.");
+            return true;
+        }
+
+        return false;
+    }
+
+    @Override
+    protected void waitForForeground() {
+        // Stop waiting and resume immediately if cancelled.
+        if (sIsCancelled) return;
+
+        super.waitForForeground();
+    }
+
+    /**
+     * Callback invoked when the host activity which initiated the data sync process is destroyed.
+     * The <b>DataSyncTask</b> cannot be reattached to another activity like in the scenarios of
+     * configuration changes causing activity recreation when the language is changed or soft
+     * keyboard is displayed on the screen. That means that the data sync process cannot continue
+     * anymore and should be terminated silently in background.
+     */
+    @Override
+    protected void onFragmentDetached() {
+        super.onFragmentDetached();
+        LogHelper.write(TAG,
+                "DataSyncTask has been detached from the host activity and will be cancelled...");
+        cancel();
+    }
+
+    @Override
+    protected DataSyncResult doInBackground(Void... voids) {
+        if (!IS_RUNNING.compareAndSet(false, true)) {
+            return DataSyncResult.Busy;
+        }
+
+        LogHelper.write(TAG, "starting data sync task");
+
+        // get location first
+        DataSyncResult locationSyncResult = getLocation();
+        if (locationSyncResult == DataSyncResult.Error
+                || locationSyncResult == DataSyncResult.InvalidAuthToken
+                || locationSyncResult == DataSyncResult.InvalidRegister
+                || locationSyncResult == DataSyncResult.AccountInactive
+                || locationSyncResult == DataSyncResult.LocationInactive) {
+            waitForForeground();
+
+            if (wasDataSyncCancelled()) return DataSyncResult.Cancelled;
+
+            return locationSyncResult;
+        }
+
+        // full sync is not needed - check the status of our data container
+        if (locationSyncResult == DataSyncResult.NotNeeded) {
+            DataSyncResult dataContainerResult = DataSyncResult.NotNeeded;
+            // the in-memory data container is not ready (everything else looks good)
+            if (!InMemoryDataContainer.getInstance().isReady()) {
+                dataContainerResult = populateDataContainer(APP);
+            }
+            waitForForeground();
+
+            if (wasDataSyncCancelled()) return DataSyncResult.Cancelled;
+
+            return dataContainerResult;
+        }
+
+        // seed number generator
+        DataSyncResult seedResult = getEntryPoint().getSeedNumberGeneratorUseCase().execute();
+        if (seedResult == DataSyncResult.Error
+                || seedResult == DataSyncResult.InvalidAuthToken
+                || seedResult == DataSyncResult.InvalidRegister
+                || seedResult == DataSyncResult.AccountInactive
+                || seedResult == DataSyncResult.LocationInactive) {
+            waitForForeground();
+
+            if (wasDataSyncCancelled()) return DataSyncResult.Cancelled;
+
+            return seedResult;
+        }
+
+        // start sync threads
+        DataSyncResult result = runFullSync();
+
+        // check status before continuing
+        if (result == DataSyncResult.Error
+                || result == DataSyncResult.InvalidAuthToken
+                || result == DataSyncResult.InvalidRegister
+                || result == DataSyncResult.AccountInactive
+                || result == DataSyncResult.LocationInactive) {
+            waitForForeground();
+
+            if (wasDataSyncCancelled()) return DataSyncResult.Cancelled;
+
+            return result;
+        }
+
+        publishProgress(getString(R.string.dialog_progress_finishing_sync));
+
+        // perform post-sync alterations
+        result = runPostSyncAlterations();
+
+        // show config DB path in logcat
+        FileHelper.logDbStoragePath(ConfigDbHelper.getCurrentDbFilename(APP));
+
+        // return result
+        waitForForeground();
+
+        if (wasDataSyncCancelled()) return DataSyncResult.Cancelled;
+
+        return result;
+    }
+
+    @Override
+    protected void onProgressUpdate(String... progress) {
+        showProgressDialog(progress[0]);
+    }
+
+    @Override
+    @CallSuper
+    protected void onPostExecute(DataSyncResult result) {
+        super.onPostExecute(result);
+
+        if (result == DataSyncResult.NotNeeded) {
+            saveMonitoringAttributes();
+            LogHelper.write(TAG, "sync not needed");
+        } else if (result == DataSyncResult.Complete) {
+            // update db & sync version last
+            PrefHelper.set(PrefKeys.SYNC_DB_VERSION, ConfigDb.VERSION);
+            PrefHelper.set(PrefKeys.SYNC_VERSION, mNewSyncVersion);
+
+            // save sync date
+            RuntimeConfigHelper.setFullSyncComplete(true);
+            RuntimeConfigHelper.updateLastFullSyncDateTime();
+
+            saveMonitoringAttributes();
+
+            LogHelper.write(TAG, "sync complete");
+        } else if (result == DataSyncResult.Error) {
+            LogHelper.write(TAG, "sync error");
+        } else if (result == DataSyncResult.Busy) {
+            LogHelper.write(TAG, "sync busy");
+        } else if (result == DataSyncResult.InvalidAuthToken) {
+            LogHelper.write(TAG, "sync invalid authtoken");
+        } else if (result == DataSyncResult.InvalidRegister) {
+            LogHelper.write(TAG, "sync invalid register");
+        } else if (result == DataSyncResult.AccountInactive) {
+            LogHelper.write(TAG, "sync account inactive");
+        } else if (result == DataSyncResult.LocationInactive) {
+            LogHelper.write(TAG, "sync location inactive");
+        } else if (result == DataSyncResult.Cancelled) {
+            LogHelper.write(TAG, "sync cancelled");
+        } else {
+            throw new IllegalStateException("SyncResult not set properly");
+        }
+
+        IS_RUNNING.set(false);
+    }
+
+    private void saveMonitoringAttributes() {
+        CrashReportingHelper
+                .setAttribute("AgencyID", String.valueOf(AccountConfigHelper.getAgencyId()));
+        CrashReportingHelper.setAttribute("AgencyName", AccountConfigHelper.getAgencyName());
+        CrashReportingHelper
+                .setAttribute("AccountId", String.valueOf(AccountConfigHelper.getAccountId()));
+        CrashReportingHelper.setAttribute("AccountLocationId",
+                String.valueOf(AccountConfigHelper.getAccountLocationId()));
+        CrashReportingHelper
+                .setAttribute("RegisterId", String.valueOf(AccountConfigHelper.getRegisterId()));
+        CrashReportingHelper
+                .setAttribute("DeviceType", String.valueOf(AccountConfigHelper.getDeviceType()));
+    }
+
+    // Location
+
+    private DataSyncResult getLocation() {
+        AccountLocationResponseExpander expander = new AccountLocationResponseExpander();
+        expander.setExpandAccount(true);
+        expander.setExpandBrand(true);
+        expander.setExpandOnlineOrderingLocation(true);
+        expander.setExpandOrganization(true);
+        expander.setExpandPaymentCardTypes(true);
+        expander.setExpandPaymentTypes(true);
+        expander.setExpandReceiptTypes(true);
+        expander.setExpandTimeClockConfiguration(true);
+        expander.setExpandSupportedHardwareIds(true);
+        expander.setExpandAgencyRegisterTemplates(true);
+        expander.setExpandInvoicingLocation(true);
+        expander.setExpandAgency(true);
+        expander.setExpandTaxInformation(true);
+
+        Response<AccountLocationResponseDto> response = new Response<>(
+                WebServices.getLocation(getAuthToken(), mAccountId, mAccountLocationId, expander));
+        if (response.isSuccessful()) {
+            try {
+                // Update Current TOS version regardless of sync version
+                PrefHelper.set(PrefKeys.CURRENT_TOS_VERSION,
+                        response.getDto().getCurrentTosVersion());
+
+                // Save Cash Rounding Type and Currency Code regardless of sync version.
+                // These values are now Agency-driven and for some reasons in the original
+                // implementation they were being retrieved by the Get Auth Token Request only
+                // flow and in scenarios when the user attempts to upgrade the
+                // app from a build which had these values hardcoded to a build with them
+                // Agency-driven then when unlocking the app using PIN the Get Auth Token flow
+                // was skipped and these values were lost.
+                AgencyResponseDto agency = response.getDto().getAgency();
+                if (agency != null) {
+                    AgencyConfigHelper.saveAgencySettings(agency);
+                    agencyFeatures.setFeatures(agency.getFeatures());
+                }
+
+                // Check if sync necessary
+                mNewSyncVersion = response.getDto().getVersion();
+
+                if (!mForceSync) {
+                    if (PrefHelper.get(PrefKeys.SYNC_VERSION, Ids.UNDEFINED) ==
+                            mNewSyncVersion) {
+                        // version hasn't changed, sync not necessary
+                        return DataSyncResult.NotNeeded;
+                    }
+                }
+
+                AccountLocationResponseDto dto = response.getDto();
+
+                PrefHelper.set(PrefKeys.LOCATION_NAME, dto.getName());
+                PrefHelper.set(PrefKeys.LOCATION_COUNTRY, dto.getCountry());
+                PrefHelper.set(PrefKeys.LOCATION_ADDRESS_STATE, dto.getState());
+                PrefHelper.set(PrefKeys.LOCATION_ADDRESS_STREET, dto.getStreetAddress1());
+                PrefHelper.set(PrefKeys.LOCATION_PHONE, dto.getPhone());
+                PrefHelper.set(PrefKeys.RECEIPT_HEADER, dto.getReceiptHeader());
+                PrefHelper.set(PrefKeys.RECEIPT_FOOTER, dto.getReceiptFooter());
+                PrefHelper.set(PrefKeys.RECEIPT_SHOW_CARDHOLDER_NAME,
+                        dto.isReceiptShowCardholderName());
+                PrefHelper.set(PrefKeys.RECEIPT_SHOW_USER_NAME, dto.isShowUserNameOnReceipt());
+                PrefHelper.set(PrefKeys.RECEIPT_SHOW_TERMINAL_IDENTIFIER,
+                        dto.isShowTerminalIdentifier());
+                PrefHelper.set(PrefKeys.RECEIPT_SHOW_ITEM_CODES, dto.isReceiptShowItemCode());
+                PrefHelper.set(PrefKeys.RECEIPT_SHOW_TAX_TABLE, dto.isReceiptShowTaxTable());
+                PrefHelper.set(PrefKeys.ALLOW_SPLIT_BALANCE, dto.isAllowSplitBalance());
+                PrefHelper.set(PrefKeys.ALLOW_CUSTOMER_TO_ORDER_ASSOCIATION,
+                        dto.isAllowCustomerToOrderAssociation());
+                PrefHelper.set(PrefKeys.SIGN_ON_SCREEN_ALLOW, dto.isAllowSignOnScreen());
+                PrefHelper.set(PrefKeys.IS_ENABLE_TRAINING_MODE, dto.isEnableTrainingMode());
+                PrefHelper.set(PrefKeys.IS_ENABLE_CASH_REFUND, dto.isEnableCashRefund());
+                PrefHelper.set(PrefKeys.IS_ENABLE_OPEN_REFUND, dto.isEnableOpenRefund());
+                PrefHelper.set(PrefKeys.IS_ENABLE_OPEN_REFUND_AMOUNT,
+                        dto.isEnableOpenRefundAmount());
+                PrefHelper.set(PrefKeys.IS_ENABLE_QUICK_SALE, dto.isEnableQuickSaleMode());
+                PrefHelper.set(PrefKeys.IS_HIDE_CARDHOLDER_NAME, dto.isHideCardholderName());
+                PrefHelper.set(PrefKeys.IS_PAYMENT_CARD_PAYMENT_TYPE_ENABLED,
+                        dto.isAllowPaymentCard());
+
+                if (dto.getTipCalculationType() != null) {
+                    PrefHelper.set(PrefKeys.TIP_CALCULATION_TYPE_ID, dto.getTipCalculationType().getKey());
+                }
+
+                // Get address rules by countryIso2Code
+                // to format the Location address and save it that way
+                // in the PrefKeys.RECEIPT_CONTACT_INFO
+                GetAddressRulesByCountryUseCase getAddressRulesByCountryUseCase =
+                        getEntryPoint().getAddressRulesByCountryUseCase();
+                List<AddressFieldRule> addressRules =
+                        getAddressRulesByCountryUseCase.execute(dto.getCountry());
+                CustomerAddress customerAddress =
+                        CustomerAddressKt.toCustomerAddress(dto, addressRules);
+                AddressFormatter addressFormatter = new AddressFormatter();
+                // Format address to four lines
+                String contactInfo =
+                        addressFormatter.formatFourLines(customerAddress, dto.getPhone());
+                // Save contact info in share prefs
+                PrefHelper.set(PrefKeys.RECEIPT_CONTACT_INFO, contactInfo);
+
+                if (dto.getReceiptThreshold() != null) {
+                    PrefHelper.set(PrefKeys.SIGNATURE_THRESHOLD,
+                            dto.getReceiptThreshold().toString());
+                } else {
+                    PrefHelper.set(PrefKeys.SIGNATURE_THRESHOLD, BigDecimal.ZERO.toString());
+                }
+                PrefHelper.set(PrefKeys.ACCESSORY_DISPLAY_AD_URL, dto.getAdUrl());
+                PrefHelper.set(PrefKeys.ACCESSORY_DISPLAY_SPLASH_URL, dto.getSplashUrl());
+                if (dto.getAvsType() != null) {
+                    PrefHelper.set(PrefKeys.AVS_TYPE, dto.getAvsType().key);
+                } else {
+                    PrefHelper.set(PrefKeys.AVS_TYPE, AvsType.None.key);
+                }
+                PrefHelper.set(PrefKeys.TRACK_INVENTORY, dto.isTrackInventory());
+                PrefHelper.set(PrefKeys.ALLOW_SALES_WITH_NO_QOH, dto.isAllowSalesWithNoQoH());
+                if (dto.getLowQuantityThreshold() != null) {
+                    PrefHelper.set(PrefKeys.LOW_QUANTITY_THRESHOLD,
+                            dto.getLowQuantityThreshold().toString());
+                } else {
+                    PrefHelper.remove(PrefKeys.LOW_QUANTITY_THRESHOLD);
+                }
+
+                // Loyalty config (sync group requires pref lock)
+                synchronized (PrefHelper.LOCK) {
+                    if (dto.getLoyaltyProviderType() != null) {
+                        PrefHelper.set(PrefKeys.LOYALTY_PROVIDER_TYPE,
+                                dto.getLoyaltyProviderType().key);
+                    } else {
+                        PrefHelper.set(PrefKeys.LOYALTY_PROVIDER_TYPE,
+                                LoyaltyProviderType.None.key);
+                    }
+                    PrefHelper.set(PrefKeys.EXTERNAL_LOYALTY_MERCHANT_ID,
+                            dto.getExternalLoyaltyMerchantId());
+                    PrefHelper.set(PrefKeys.SHOW_LOYALTY_PROMPT_ON_CHECKOUT,
+                            dto.isShowLoyaltyPromptOnCheckout());
+                }
+
+                PrefHelper.set(PrefKeys.IS_GATEWAY_ENABLED, dto.isGatewayEnabled());
+                TimeClockConfigurationResponseDto timeClockConfig = dto.getTimeClockConfiguration();
+                if (timeClockConfig != null && timeClockConfig.isActive()) {
+                    PrefHelper.set(PrefKeys.IS_TIME_CLOCK_ENABLED, timeClockConfig.isActive());
+                    PrefHelper.set(PrefKeys.TIME_CLOCK_PROMPT_FOR_CASH_TIPS,
+                            timeClockConfig.isPromptForCashTips());
+                    PrefHelper.set(PrefKeys.TIME_CLOCK_ALL_BREAKS_PAID,
+                            timeClockConfig.isAllBreaksPaid());
+                    PrefHelper.set(PrefKeys.TIME_CLOCK_PAID_BREAKS_THRESHOLD,
+                            timeClockConfig.getPaidBreakThreshold());
+                    PrefHelper.set(PrefKeys.TIME_CLOCK_PAY_PERIOD_TYPE,
+                            timeClockConfig.getPayPeriodType().key);
+                    PrefHelper.set(PrefKeys.TIME_CLOCK_ENABLE_DAILY_OVERTIME,
+                            timeClockConfig.isEnableDailyOvertime());
+                    PrefHelper.set(PrefKeys.TIME_CLOCK_ENABLE_WEEKLY_OVERTIME,
+                            timeClockConfig.isEnableWeeklyOvertime());
+
+                    if (timeClockConfig.getPayPeriodStartDate() != null) {
+                        PrefHelper.set(PrefKeys.TIME_CLOCK_PAY_PERIOD_START_DATE,
+                                timeClockConfig.getPayPeriodStartDate().getTime());
+                    }
+
+                    if (timeClockConfig.getDayOfMonthType() != null) {
+                        PrefHelper.set(PrefKeys.TIME_CLOCK_PAY_PERIOD_DAY_OF_MONTH,
+                                timeClockConfig.getDayOfMonthType().key);
+                    }
+
+                    if (timeClockConfig.getStartDayOfWeekType() != null) {
+                        PrefHelper.set(PrefKeys.TIME_CLOCK_PAY_PERIOD_START_DAY_OF_WEEK,
+                                timeClockConfig.getStartDayOfWeekType().key);
+                    }
+
+                    if (timeClockConfig.getDailyHoursBeforeOT() != null) {
+                        PrefHelper.set(PrefKeys.TIME_CLOCK_DAILY_HOURS_BEFORE_OT,
+                                timeClockConfig.getDailyHoursBeforeOT());
+                    }
+
+                    if (timeClockConfig.getWeeklyHoursBeforeOT() != null) {
+                        PrefHelper.set(PrefKeys.TIME_CLOCK_WEEKLY_HOURS_BEFORE_OT,
+                                timeClockConfig.getWeeklyHoursBeforeOT());
+                    }
+                } else {
+                    PrefHelper.set(PrefKeys.IS_TIME_CLOCK_ENABLED, false);
+                    // reset this flag so if/when timeclock is re/enabled, the latest open shifts
+                    // will be acquired again:
+                    PrefHelper.set(PrefKeys.IS_TIME_CLOCK_INITIAL_SHIFTS_ACQUIRED, false);
+                }
+                PrefHelper.set(PrefKeys.IS_ALLOW_FORCED_AUTH, dto.isAllowForcedAuth());
+                if (dto.getTipMethod() != null) {
+                    PrefHelper.set(PrefKeys.TIP_METHOD, dto.getTipMethod().key);
+                } else {
+                    PrefHelper.set(PrefKeys.TIP_METHOD, TipMethod.None.key);
+                }
+                PrefHelper.set(PrefKeys.IS_ALLOW_MANUAL_CARD_ENTRY, dto.isAllowManualCardEntry());
+
+                if (dto.getTimeZone() != null) {
+                    PrefHelper.set(PrefKeys.TIMEZONE_ID, dto.getTimeZone().tzId);
+                } else {
+                    PrefHelper.set(PrefKeys.TIMEZONE_ID, "");
+                }
+                DateTimeZone.setDefault(
+                        DateTimeZone.forTimeZone(AccountConfigHelper.getDisplayTimeZone()));
+
+                PrefHelper.set(PrefKeys.REQUIRE_CHECKOUT_ORDER_INFO,
+                        dto.isRequiresCheckoutOrderInfo());
+
+                if (dto.getAccount() != null) {
+                    PrefHelper.set(PrefKeys.ACCOUNT_NAME, dto.getAccount().getName());
+
+                    // AccountType
+                    AccountType accountType = dto.getAccount().getAccountType();
+                    if (accountType != null) {
+                        PrefHelper.set(PrefKeys.ACCOUNT_TYPE, accountType.key);
+                    } else {
+                        PrefHelper.set(PrefKeys.ACCOUNT_TYPE, AccountType.Restaurant.key);
+                    }
+
+                    // Merchant Account Type (Standard, ProPay)
+                    MerchantAccountType merchantAccountType =
+                            dto.getAccount().getMerchantAccountType();
+                    PrefHelper.set(PrefKeys.MERCHANT_ACCOUNT_TYPE,
+                            Objects.requireNonNullElse(
+                                    merchantAccountType, MerchantAccountType.Standard).getKey());
+
+                    if (dto.getAccount().getPinTypeId() != null) {
+                        PrefHelper.set(PrefKeys.PIN_TYPE, dto.getAccount().getPinTypeId().key);
+                    }
+
+                    // Transaction Custom Fields
+                    PrefHelper.set(PrefKeys.IS_TRANSACTION_FIELDS_ENABLED,
+                            dto.getAccount().isTransactionFieldsEnabled());
+                } else {
+                    // Failsafe - Default to Restaurant
+                    PrefHelper.set(PrefKeys.ACCOUNT_TYPE, AccountType.Restaurant.key);
+                }
+
+                PrefHelper.set(PrefKeys.ALLOW_SCREEN_LOCK_PIN, dto.isAllowScreenLockPin());
+
+                Set<String> paymentTypes = new HashSet<>();
+                if (dto.getPaymentTypes() != null) {
+                    for (PaymentType pType : dto.getPaymentTypes()) {
+                        if (pType == null) {
+                            // non-existent PaymentType was deserialized, skip it
+                            continue;
+                        }
+                        paymentTypes.add(pType.name());
+                    }
+                }
+                PrefHelper.set(PrefKeys.PAYMENT_TYPES, paymentTypes);
+
+                Set<String> paymentCardTypes = new HashSet<>();
+                if (dto.getPaymentCardTypes() != null) {
+                    for (PaymentCardType pcType : dto.getPaymentCardTypes()) {
+                        if (pcType == null) {
+                            // non-existent PaymentCardType was deserialized, skip it
+                            continue;
+                        }
+                        paymentCardTypes.add(pcType.name());
+                    }
+                }
+                PrefHelper.set(PrefKeys.PAYMENT_CARD_TYPES, paymentCardTypes);
+
+                Set<String> receiptTypes = new HashSet<>();
+                if (dto.getReceiptTypes() != null) {
+                    for (ReceiptType rType : dto.getReceiptTypes()) {
+                        if (rType == null) {
+                            // non-existent ReceiptType was deserialized, skip it
+                            continue;
+                        }
+                        receiptTypes.add(rType.name());
+                    }
+                }
+
+                if (dto.getReceiptOption() != null) {
+                    PrefHelper.set(PrefKeys.RECEIPT_OPTION, dto.getReceiptOption().key);
+                }
+
+                PrefHelper.set(PrefKeys.RECEIPT_TYPES, receiptTypes);
+                PrefHelper.set(PrefKeys.IS_MANUAL_TAX_FREE_ITEM_ENABLED,
+                        dto.isManualTaxFreeItemEnabled());
+                PrefHelper.set(PrefKeys.IS_ENABLE_ORDER_TAX_EXEMPT, dto.isEnableOrderTaxExempt());
+                PrefHelper.set(PrefKeys.IS_ENABLE_PIN_LOGIN, dto.isEnablePinLogin());
+                PrefHelper.set(PrefKeys.IS_DISMISS_RECEIPT, dto.isDismissReceipt());
+
+                // Merchant Tax Information
+                String serializedList = GsonHelper.getGsonForSerialization(false)
+                        .toJson(dto.getMerchantTaxInformation());
+                PrefHelper.set(PrefKeys.MERCHANT_TAX_INFORMATION_LIST, serializedList);
+
+                PrefHelper.set(PrefKeys.MERCHANT_EMAIL, dto.getMerchantEmail());
+                PrefHelper.set(PrefKeys.RECEIPT_SHOW_TAX_INFORMATION,
+                        dto.isReceiptShowTaxInformation());
+                PrefHelper.set(PrefKeys.IS_ENABLE_SALES_RECORDING_MODULE,
+                        dto.isEnableSalesRecordingModule());
+
+                // brand data
+                PrefHelper.set(PrefKeys.BRAND_PORTAL_URL, dto.getBrand().getPortalUrl());
+                PrefHelper.set(PrefKeys.BRAND_PORTAL_URL_SLUG, dto.getBrand().getUrlSlug());
+                PrefHelper.set(PrefKeys.BRAND_SUPPORT_TYPE,
+                        dto.getBrand().getBrandSupportType().key);
+                PrefHelper.set(PrefKeys.BRAND_SUPPORT_URL, dto.getBrand().getSupportUrl());
+                PrefHelper.set(PrefKeys.BRAND_HELP_URL, dto.getBrand().getHelpUrl());
+                saveBrandUrls(dto.getBrand().getLegalUrls());
+                PrefHelper.set(PrefKeys.ORGANIZATION_ID, dto.getBrand().getOrganizationId());
+                PrefHelper.set(PrefKeys.BRAND_SUPPORT_PHONE_NUMBER,
+                        dto.getBrand().getSupportPhoneNumber());
+
+                // Online Ordering
+                if (dto.getOnlineOrderingLocation() != null) {
+                    OnlineOrderingLocationResponseDto onlineOrderingLocation =
+                            dto.getOnlineOrderingLocation();
+                    PrefHelper.set(PrefKeys.ONLINE_ORDERING_IS_ACTIVE, true);
+                    PrefHelper.set(PrefKeys.ONLINE_ORDERING_ADD_RECEIPT_ADVERTISEMENT,
+                            onlineOrderingLocation.isAddReceiptAdvertisement());
+                    if (onlineOrderingLocation.getOnlineOrderingStatusType() != null) {
+                        PrefHelper.set(PrefKeys.ONLINE_ORDERING_STATUS_TYPE_ID,
+                                onlineOrderingLocation.getOnlineOrderingStatusType().key);
+                    }
+                    PrefHelper.set(PrefKeys.ONLINE_ORDERING_PICKUP_INSTRUCTIONS,
+                            onlineOrderingLocation.getPickupInstructions());
+                    PrefHelper.set(PrefKeys.ONLINE_ORDERING_URL, dto.getOnlineOrderingUrl());
+                } else {
+                    // A null location property indicates online ordering is disabled
+                    // (or not active) for the account.
+                    PrefHelper.set(PrefKeys.ONLINE_ORDERING_IS_ACTIVE, false);
+                }
+
+                // Order Info menu items
+                accountConfig.saveBusinessInfoOptions(dto.getBusinessInfoOptions());
+
+                // Invoice Location
+                if (dto.getInvoicingLocation() != null) {
+                    if (dto.getInvoicingLocation().getInvoicingLocationStatusType() != null) {
+                        InvoicingLocationResponseDto invoicingLocation = dto.getInvoicingLocation();
+                        PrefHelper.set(PrefKeys.INVOICING_LOCATION_STATUS_TYPE_ID,
+                                invoicingLocation.getInvoicingLocationStatusType().key);
+                    }
+                }
+
+                // Supported Hardware Ids
+                // * Note do not clear prefs if value is null as that should be taken as an invalid
+                // config.  To "unassign" all hardware, there should be an empty list.
+                if (dto.getSupportedHardwareIds() != null) {
+                    String serializedHardwareIds = GsonHelper.getGsonForSerialization(false)
+                            .toJson(dto.getSupportedHardwareIds());
+                    PrefHelper.set(PrefKeys.LOCATION_SUPPORTED_HARDWARE_IDS, serializedHardwareIds);
+                } else {
+                    LogHelper.write(TAG,
+                            "getLocation: getSupportedHardwareIds is NULL - leaving pref as is");
+                }
+
+                if (dto.getAgencyRegisterTemplates() != null &&
+                        !dto.getAgencyRegisterTemplates().isEmpty()) {
+                    parseLocationAgencyTemplates(dto.getAgencyRegisterTemplates());
+                } else {
+                    LogHelper.write(TAG,
+                            "getLocation: getAgencyRegisterTemplates is NULL or empty");
+                }
+
+                if (!TextUtils.isEmpty(dto.getCloudAmqpConnection())) {
+                    boolean restartRequired = false;
+                    if (!dto.getCloudAmqpConnection().equals(
+                            PrefHelper.get(PrefKeys.CLOUDAMQP_CONNECTION, null, true))) {
+                        // creds have changed
+                        restartRequired = true;
+                    } else if (FlavorHelper.isRestartRabbitMqOnSync()) {
+                        // something flavor-specific requires a rabbit restart
+                        restartRequired = true;
+                    }
+
+                    PrefHelper.set(PrefKeys.CLOUDAMQP_CONNECTION, dto.getCloudAmqpConnection(),
+                            true);
+
+                    if (restartRequired) {
+                        SyncServiceHelper.restart(false);
+                    }
+                }
+
+                mReceiptImageUrl = dto.getReceiptLogoUrl();
+
+                /*
+                 * Gift Card Information
+                 */
+                // Terminal Gift Card Processing
+                PrefHelper.set(PrefKeys.IS_TERMINAL_GIFT_CARD_PROCESSING,
+                        dto.isTerminalGiftCardProcessing());
+                // Gift Card Enabled
+                PrefHelper.set(PrefKeys.IS_GIFT_CARD_ENABLED, dto.isGiftCardEnabled());
+
+                return DataSyncResult.Complete;
+            } catch (Exception e) {
+                LogHelper.write(TAG, e);
+                LogHelper.write(TAG, getErrorText("getLocation()", e));
+            }
+        } else {
+            LogHelper.write(TAG, getErrorText("getLocation()", response));
+        }
+
+        return getUnsuccessfulResultType(response);
+    }
+
+    private void parseLocationAgencyTemplates(
+            @Nullable List<AgencyRegisterTemplateDto> agencyTemplates) {
+        if (agencyTemplates != null && !agencyTemplates.isEmpty()) {
+            Map<Integer, AgencyRegisterTemplateDto> agencyTemplateMap = new HashMap<>();
+            for (AgencyRegisterTemplateDto template : agencyTemplates) {
+                agencyTemplateMap.put(template.getRegisterTemplateId(), template);
+            }
+            PrefHelper.set(PrefKeys.LOCATION_SUPPORTED_TEMPLATES_MAP, agencyTemplateMap);
+        }
+    }
+
+    private void parseRegisterAgencyTemplate(
+            @Nullable AgencyRegisterTemplateDto registerAgencyTemplate) {
+        if (registerAgencyTemplate == null) {
+            LogHelper.write(TAG,
+                    "RegisterRunner: AgencyRegisterTemplates is NULL , leaving prefs as is");
+            return;
+        }
+        AgencyRegisterTemplateHelper.setRegisterSupportedTemplate(registerAgencyTemplate);
+    }
+
+    // In-Memory Data Container
+
+    /**
+     * Populates the in-memory data container only. Usually just returns
+     * {@link DataSyncResult#NotNeeded} to mirror the behavior of the
+     * {@link #getLocation()} method.
+     */
     @WorkerThread
-    private fun handleResponse(response: Response<DemographicResponseDto?>): DataSyncResponse {
-        val responseDto = response.dto ?: return onSyncNullResponse()
+    private static DataSyncResult populateDataContainer(@NonNull Context context) {
+        LogHelper.write(Level.FINE, TAG, "Populating in-memory data container...");
 
-        return try {
-            // Insert response into DB
-            responseDto.states?.let {
-                repo.insertStates(it)
-                addProgress(it.size)
+        try {
+            // Order Types
+            List<OrderTypeDto> orderTypes = DataAccessHelper.readOrderTypes(context);
+            InMemoryDataContainer.getInstance().setOrderTypes(orderTypes);
+
+            return DataSyncResult.NotNeeded;
+        } catch (Exception e) {
+            LogHelper.write(TAG, e);
+            return DataSyncResult.Error;
+        }
+    }
+
+    // Full Runner Set
+
+    private DataSyncResult runFullSync() {
+        // switch to other database
+        switchDbFile();
+
+        long startTime = System.currentTimeMillis();
+
+        mRunners = new ArrayList<>();
+        mRunners.add(new RegisterRunner());
+        mRunners.add(new ProviderConfigRunner());
+        mRunners.add(new CategoriesRunner());
+        // The Products List DTO is one of our more complex (large) data models,
+        // and it is common for merchants to have more products than other data
+        // sets (like Taxes or Discounts), so the Products API typically requires
+        // longer to stream the response body from the server; therefore, reducing
+        // the page size should improve the resilience of this runner.
+        mRunners.add(new ProductsRunner(600));
+        mRunners.add(new TagsRunner());
+        mRunners.add(new TagProductAssnsRunner(1111));
+        mRunners.add(new ModifiersRunner());
+        mRunners.add(new ModifierSetsRunner());
+        mRunners.add(new ModifierSetAssnsRunner());
+        mRunners.add(new ProductModifierSetAssnsRunner(1111));
+        mRunners.add(new TaxesRunner(1111));
+        mRunners.add(new ProductTaxesRunner(1111));
+        mRunners.add(new DiscountsRunner());
+        mRunners.add(new DiscountProductAssnsRunner(1111));
+        mRunners.add(new PromotionsRunner());
+        mRunners.add(new PromotionProductAssnsRunner(1111));
+        mRunners.add(new SalesEventsRunner());
+        mRunners.add(new SalesEventPromotionAssnsRunner(1111));
+        mRunners.add(new IdentifiersRunner());
+        mRunners.add(new StationsRunner());
+        mRunners.add(new ProgramTypesRunner());
+        mRunners.add(new MessagesRunner());
+        mRunners.add(new UsersRunner());
+        mRunners.add(new RolesRunner());
+        mRunners.add(new CustomTendersRunner());
+        mRunners.add(new CustomTransactionFieldsRunner());
+        mRunners.add(new ReceiptLogoRunner(mReceiptImageUrl));
+        mRunners.add(new LoyaltyProgramRunner());
+        mRunners.add(new RegisterHardwareRunner());
+        mRunners.add(new ConstantsRunner());
+        mRunners.add(new TimeclockShiftsRunner(1111));
+        mRunners.add(new VouchersRunner());
+
+        List<Thread> threads = new ArrayList<>();
+
+        for (BaseRunner runner : mRunners) {
+            threads.add(new Thread(runner));
+        }
+        for (Thread thread : threads) {
+            thread.start();
+        }
+        for (Thread thread : threads) {
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                LogHelper.write(TAG, e);
+            }
+        }
+
+        DataSyncResponse dataSyncUseCasesResponse = executeDataSyncUseCases();
+        DataSyncResult syncResult = dataSyncUseCasesResponse.getDataSyncResult();
+
+        long totalTime = System.currentTimeMillis() - startTime;
+        double overallTime = totalTime / 1000.0;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("PROVISIONING REPORT:");
+        sb.append(" Overall Time: ").append(overallTime).append("s").append("\n");
+        for (BaseRunner runner : mRunners) {
+            String name = runner.getClass().getSimpleName();
+            DataSyncResult result = runner.getResult();
+            int totalPages = runner.getTotalPages();
+            int totalAttempts = runner.getTotalAttempts();
+            double shortestTimeSec = runner.getShortestTime() / 1000.0;
+            double longestTimeSec = runner.getLongestTime() / 1000.0;
+            String errorText = runner.errorText;
+
+            sb.append(name).append(": ").append(result);
+            if (totalPages > 0) {
+                sb.append(" / ").append("Total Pages: ").append(totalPages);
+            }
+            if (totalAttempts > 1) {
+                int repeatAttempts = totalAttempts - 1;
+                if (totalPages > 0) {
+                    repeatAttempts = totalAttempts - totalPages;
+                }
+                if (repeatAttempts > 0) {
+                    sb.append(" / ").append("REPEAT REQUESTS: ").append(repeatAttempts);
+                }
+            }
+            if (shortestTimeSec != longestTimeSec) {
+                sb.append(" / ").append("Shortest Time: ").append(shortestTimeSec).append("s");
+                sb.append(" / ").append("Longest Time: ").append(longestTimeSec).append("s");
+            } else {
+                sb.append(" / ").append("Time: ").append(shortestTimeSec).append("s");
             }
 
-            responseDto.countries?.let {
-                repo.insertCountries(it)
-                addProgress(it.size)
+            if (result == DataSyncResult.Error
+                    || result == DataSyncResult.InvalidAuthToken
+                    || result == DataSyncResult.InvalidRegister
+                    || result == DataSyncResult.AccountInactive
+                    || result == DataSyncResult.LocationInactive
+                    || result == DataSyncResult.Cancelled) {
+                if (result == DataSyncResult.Error) {
+                    // invalid authtoken/register take higher priority
+                    if (syncResult != DataSyncResult.InvalidAuthToken
+                            && syncResult != DataSyncResult.InvalidRegister
+                            && syncResult != DataSyncResult.AccountInactive
+                            && syncResult != DataSyncResult.LocationInactive) {
+                        syncResult = result;
+                    }
+                } else if (result == DataSyncResult.InvalidAuthToken) {
+                    // invalid register takes higher priority
+                    if (syncResult != DataSyncResult.InvalidRegister
+                            && syncResult != DataSyncResult.AccountInactive
+                            && syncResult != DataSyncResult.LocationInactive) {
+                        syncResult = result;
+                    }
+                } else {
+                    syncResult = result;
+                }
+
+                if (result == DataSyncResult.Cancelled) {
+                    sb.append(" / ").append("INFO: ").append(errorText);
+                } else {
+                    sb.append(" / ").append("ERROR INFO: ").append(errorText);
+                }
             }
-            onSyncComplete()
-        } catch (e: Exception) {
-            onSyncException(e)
+
+            sb.append("\n");
+        }
+
+        // Appends the Provision Report for all use cases synced.
+        sb.append(dataSyncUseCasesResponse.getProvisionReport());
+
+        String reportText = sb.toString();
+
+        if (syncResult != DataSyncResult.Complete) {
+            // switch back to previous valid DB
+            switchDbFile();
+
+            LogEventHelper.saveEvent(AuditLevel.Debug, TAG, "Provisioning Error: " + reportText);
+        } else {
+            LogHelper.write(TAG, reportText);
+        }
+
+        return syncResult;
+    }
+
+    /**
+     * Executes {@link DataSyncUseCases} and perform a sync on all use cases.
+     */
+    private DataSyncResponse executeDataSyncUseCases() {
+        DataSyncUseCases dataSyncUseCases = getEntryPoint().getDataSyncUseCases();
+
+        DataSyncPayload payload = DataSyncPayload.newInstance(mForceSync, this::updateProgress);
+
+        return dataSyncUseCases.execute(payload);
+    }
+
+    private void switchDbFile() {
+        ConfigDbHelper.setCurrentDbPrimary(APP, !ConfigDbHelper.isCurrentDbPrimary(APP));
+    }
+
+    private class RegisterRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            Response<RegisterResponseDto> response = null;
+
+            RegisterExpander expander = new RegisterExpander();
+            expander.setExpandAgencyRegisterTemplates(true);
+
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getRegister(getAuthToken(),
+                        AccountConfigHelper.getRegisterId(), expander));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (response.getDto() != null) {
+                        AccountConfigHelper.setRegisterName(response.getDto().getName());
+                        AccountConfigHelper.setRegisterOrderNumberSeries(
+                                response.getDto().getOrderNumberSeries());
+                        AccountConfigHelper.setRegisterAutoBatchCloseTime(
+                                response.getDto().getAutoBatchCloseTime());
+                        AccountConfigHelper.setAutoBatchCloseFinalizedTendersRequired(
+                                response.getDto().isAutoBatchCloseFinalizedTendersRequired());
+                        AccountConfigHelper.setEnableAudibleAlerts(
+                                response.getDto().isEnableAudibleAlert());
+                        String defaultStartingCashAmount =
+                                response.getDto().getStartingCashAmount();
+                        if (defaultStartingCashAmount != null) {
+                            BatchHelper.setDefaultBatchStartingCashAmount(
+                                    new BigDecimal(defaultStartingCashAmount));
+                        } else {
+                            BatchHelper.setDefaultBatchStartingCashAmount(BigDecimal.ZERO);
+                        }
+
+                        // Agency Register Template
+                        parseRegisterAgencyTemplate(response.getDto().getAgencyRegisterTemplate());
+                    }
+                    addProgress(1);
+                    result = DataSyncResult.Complete;
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class ProviderConfigRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            Response<ProviderConfigListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.providerConfigApi()
+                        .getProviderConfigListSync(getAuthToken(),
+                                mAccountId, mAccountLocationId,
+                                AccountConfigHelper.getRegisterId()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (response.getDto() != null
+                            && response.getDto().getProviders() != null) {
+                        ProviderConfigListResponseDto dto = response.getDto();
+
+                        synchronized (PrefHelper.LOCK) {
+                            ProviderConfigHelper.saveProviderConfiguration(dto);
+                        }
+                    }
+                    addProgress(1);
+                    result = DataSyncResult.Complete;
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class UsersRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            UsersDao usersDao = new UsersDao(APP);
+            UserRoleAssnsDao assnsDao = new UserRoleAssnsDao(APP);
+
+            UserListResponseExpander expander = new UserListResponseExpander();
+            expander.setExpandPermissions(true);
+            expander.setExpandRoleAssns(true);
+            expander.setExpandBusinessServicesPermissions(true);
+
+            Response<UserListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getUsers(getAuthToken(), expander));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (usersDao.setUsers(response.getDto().getUsers())) {
+                        if (assnsDao.setUserRoleAssns(response.getDto().getUsers())) {
+                            addProgress(response.getDto().getUsers());
+                            result = DataSyncResult.Complete;
+                        } else {
+                            errorText = "UserRoleAssnsDao.setUserRoleAssns() failed";
+                        }
+                    } else {
+                        errorText = "UsersDao.setUsers() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class RolesRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            RolesDao dao = new RolesDao(APP);
+
+            Response<RoleListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getRoles(getAuthToken(), mAccountLocationId));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setRoles(response.getDto().getRoles())) {
+                        addProgress(response.getDto().getRoles());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "RolesDao.setRoles() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class CustomTendersRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            CustomTendersDao dao = new CustomTendersDao(APP);
+
+            Response<CustomTenderListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getCustomTenders(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setCustomTenders(response.getDto().getCustomTenders())) {
+                        addProgress(response.getDto().getCustomTenders());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "CustomTendersDao.setCustomTenders() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class CustomTransactionFieldsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            Response<CustomTransactionFieldsDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(
+                        WebServices.getCustomTransactionFields(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (response.getDto().getCustomTransactionFields() != null &&
+                            !response.getDto().getCustomTransactionFields().isEmpty()) {
+                        addProgress(response.getDto().getCustomTransactionFields());
+                        String serializedJson = GsonHelper.getGsonForSerialization(false)
+                                .toJson(response.getDto());
+                        PrefHelper.set(PrefKeys.CUSTOM_TRANSACTION_FIELDS_LIST, serializedJson);
+                    }
+                    result = DataSyncResult.Complete;
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class CategoriesRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            CategoriesDao dao = new CategoriesDao(APP);
+
+            Response<CategoryListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getCategoryList(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setCategories(response.getDto().getCategories())) {
+                        addProgress(response.getDto().getCategories());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "CategoriesDao.setCategories() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class ProductsRunner extends PagedBaseRunner {
+        ProductsRunner(int pageSize) {
+            super(pageSize);
+        }
+
+        private long getDelayMillis() {
+            final long baseDelayMillis = 1000L;
+            return baseDelayMillis + (getAttemptCount() * 100L);
+        }
+
+        private boolean isRetryAllowed(@NonNull Response<ProductListResponseDto> response) {
+            @Nullable ProductListResponseDto dto = response.getDto();
+
+            if (dto != null && dto.getData() == null
+                    && response.getHttpStatusCode() == HttpStatusCode.OK) {
+                /*
+                In the event of a Socket timeout, we can sometimes still receive a 200 (OK)
+                response, but the OkHttp client will partially fail to stream the response body,
+                resulting in null data. This scenario should allow for a retry attempt, since
+                it is most likely caused by a network issue (poor signal strength, etc).
+
+                2023-07-21 12:56:17.583 : NetHelper  >  java.net.SocketTimeoutException: timeout
+                    at okhttp3.internal.http2.Http2Stream$StreamTimeout.newTimeoutException(Http2Stream.kt:675)
+                    at okhttp3.internal.http2.Http2Stream$StreamTimeout.exitAndThrowIfTimedOut(Http2Stream.kt:684)
+                    at okhttp3.internal.http2.Http2Stream$FramingSource.read(Http2Stream.kt:379)
+                    at okhttp3.internal.connection.Exchange$ResponseBodySource.read(Exchange.kt:276)
+                    at okio.RealBufferedSource.read(RealBufferedSource.kt:39)
+                    at okio.RealBufferedSource.exhausted(RealBufferedSource.kt:49)
+                    at okio.InflaterSource.refill(InflaterSource.kt:112)
+                    at okio.InflaterSource.readOrInflate(InflaterSource.kt:76)
+                    at okio.InflaterSource.read(InflaterSource.kt:49)
+                    at okio.GzipSource.read(GzipSource.kt:69)
+                    at okio.Buffer.writeAll(Buffer.kt:1084)
+                    at okio.RealBufferedSource.readString(RealBufferedSource.kt:95)
+                    at okhttp3.ResponseBody.string(ResponseBody.kt:187)
+                    at com.imobile3.pos.library.net.NetOkHttpHelper.getResponseBody(NetOkHttpHelper.kt:224)
+                 */
+                return true;
+            }
+
+            return response.isRetryable();
+        }
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            ProductsDao dao = new ProductsDao(APP);
+
+            resetPagingFilter();
+
+            while (previousCursor != nextCursor
+                    || isFirstPage) {
+                if (sIsCancelled) {
+                    createCancelledResult();
+                    return;
+                }
+
+                incrementPageCount();
+
+                Response<ProductListResponseDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    if (sIsCancelled) {
+                        createCancelledResult();
+                        return;
+                    }
+
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(WebServices.getProductList(getAuthToken(),
+                            pagingFilter));
+                    markEndTime();
+                    if (response.isSuccessful() && response.getDto().getData() != null) {
+                        // Successful response from the Product List API.
+                        break;
+                    }
+
+                    if (!isRetryAllowed(response)) {
+                        // Retry is not allowed - fall through to the next sequence and
+                        // assign an appropriate error message.
+                        break;
+                    }
+
+                    // Pause for a moment after each Web Service failure, using a
+                    // progressively longer duration (based on the number of attempts)
+                    delay(getDelayMillis());
+                }
+
+                if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() != null) {
+                    try {
+                        if (dao.setProducts(response.getDto().getData(), isFirstPage)) {
+                            addProgress(response.getDto().getData());
+                            isFirstPage = false;
+                        } else {
+                            errorText = "ProductsDao.setProducts() failed";
+                            return;
+                        }
+                    } catch (Exception e) {
+                        LogHelper.write(TAG, e);
+                        errorText = getErrorText(e);
+                        return;
+                    }
+
+                    previousCursor = response.getDto().getPreviousCursor();
+                    nextCursor = response.getDto().getNextCursor();
+
+                    if (nextCursor != 0) {
+                        pagingFilter.setCursor(nextCursor);
+                    }
+                } else if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() == null) {
+                    errorText = "Response successful but no data returned";
+                    return;
+                } else {
+                    errorText = getErrorText(response);
+                    result = getUnsuccessfulResultType(response);
+                    return;
+                }
+
+                // handy way to prevent day-long product syncs while debugging
+                //                if (com.imobile3.pos.BuildConfig.DEBUG && getProgress() > 500) {
+                //                    break;
+                //                }
+            }
+
+            result = DataSyncResult.Complete;
+        }
+    }
+
+    private class TagsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            TagsDao dao = new TagsDao(APP);
+
+            Response<OrderEntryTagListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getTagList(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                String bogusStartTime = "00:00:00";
+                String bogusEndTime = "23:59:59";
+                String bogusGlyph = "0";
+                BigDecimal bogusPrice = BigDecimal.ZERO;
+                GlyphType bogusGlyphType = GlyphType.Restaurant;
+
+                // insert Manual Entry tag at beginning of list (all values required)
+                OrderEntryTagResponseDto manualEntryTag = new OrderEntryTagResponseDto();
+                manualEntryTag.setId(TagsDao.MANUAL_ENTRY_ID);
+                manualEntryTag.setRevisionDateTime(new Date());
+                manualEntryTag.setName(getString(R.string.current_order_tag_name_manual_entry));
+                manualEntryTag.setOrdinal(TagsDao.MANUAL_ENTRY_ORDINAL);
+                manualEntryTag.setColor(ContextCompat.getColor(APP,
+                        R.color.color_purple));
+                manualEntryTag.setStartTime(bogusStartTime);
+                manualEntryTag.setEndTime(bogusEndTime);
+                manualEntryTag.setGlyph(bogusGlyph);
+                manualEntryTag.setGlyphType(bogusGlyphType);
+                manualEntryTag.setPrice(bogusPrice);
+                response.getDto().getTags().add(0, manualEntryTag);
+
+                // insert Search tag at beginning of list (all values required)
+                OrderEntryTagResponseDto searchTag = new OrderEntryTagResponseDto();
+                searchTag.setId(TagsDao.SEARCH_ID);
+                searchTag.setRevisionDateTime(new Date());
+                searchTag.setName(getString(R.string.current_order_tag_name_search));
+                searchTag.setOrdinal(TagsDao.SEARCH_ORDINAL);
+                searchTag.setColor(ContextCompat.getColor(APP, R.color.color_amber));
+                searchTag.setStartTime(bogusStartTime);
+                searchTag.setEndTime(bogusEndTime);
+                searchTag.setGlyph(bogusGlyph);
+                searchTag.setGlyphType(bogusGlyphType);
+                searchTag.setPrice(bogusPrice);
+                response.getDto().getTags().add(0, searchTag);
+
+                // insert 'Add Item Screen' tag
+                // Not available in Scholastic app
+                if (!FlavorHelper.isScholastic()) {
+                    OrderEntryTagResponseDto addItem = new OrderEntryTagResponseDto();
+                    addItem.setId(TagsDao.ADD_ITEM_SCREEN_ID);
+                    addItem.setRevisionDateTime(new Date());
+                    addItem.setName(getString(R.string.screen_item_add_new_screen));
+                    addItem.setOrdinal(Integer.MAX_VALUE);
+                    addItem.setColor(
+                            ContextCompat.getColor(APP, R.color.button_action_color_default));
+                    addItem.setStartTime(bogusStartTime);
+                    addItem.setEndTime(bogusEndTime);
+                    addItem.setGlyph(bogusGlyph);
+                    addItem.setGlyphType(bogusGlyphType);
+                    addItem.setPrice(bogusPrice);
+                    response.getDto().getTags().add(addItem);
+                }
+                // write list to db
+                try {
+                    if (dao.setTags(response.getDto().getTags())) {
+                        addProgress(response.getDto().getTags());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "TagsDao.setTags() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class TagProductAssnsRunner extends PagedBaseRunner {
+        TagProductAssnsRunner(int pageSize) {
+            super(pageSize);
+        }
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            TagProductAssnsDao dao = new TagProductAssnsDao(APP);
+
+            resetPagingFilter();
+
+            while (previousCursor != nextCursor
+                    || isFirstPage) {
+                incrementPageCount();
+
+                Response<OrderEntryTagProductAssnListResponseDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(WebServices.getTagProductAssnList(getAuthToken(),
+                            pagingFilter));
+                    markEndTime();
+                    if ((response.isSuccessful()
+                            && response.getDto().getData() != null)
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() != null) {
+                    try {
+                        if (dao.setTagProductAssns(response.getDto().getData(), isFirstPage)) {
+                            addProgress(response.getDto().getData());
+                            isFirstPage = false;
+                        } else {
+                            errorText = "TagProductAssnsDao.setTagProductAssns() failed";
+                            return;
+                        }
+                    } catch (Exception e) {
+                        LogHelper.write(TAG, e);
+                        errorText = getErrorText(e);
+                        return;
+                    }
+
+                    previousCursor = response.getDto().getPreviousCursor();
+                    nextCursor = response.getDto().getNextCursor();
+
+                    if (nextCursor != 0) {
+                        pagingFilter.setCursor(nextCursor);
+                    }
+                } else if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() == null) {
+                    errorText = "Response successful but no data returned";
+                    return;
+                } else {
+                    errorText = getErrorText(response);
+                    result = getUnsuccessfulResultType(response);
+                    return;
+                }
+            }
+
+            result = DataSyncResult.Complete;
+        }
+    }
+
+    private class ModifiersRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            ModifiersDao dao = new ModifiersDao(APP);
+
+            Response<ModifierListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getModifierList(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setModifiers(response.getDto().getModifiers())) {
+                        addProgress(response.getDto().getModifiers());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "ModifiersDao.setModifiers() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class ModifierSetsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            ModifierSetsDao dao = new ModifierSetsDao(APP);
+
+            Response<ModifierSetListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getModifierSetList(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setModifierSets(response.getDto().getModifierSets())) {
+                        addProgress(response.getDto().getModifierSets());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "ModifierSetsDao.setModifierSets() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class ModifierSetAssnsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            ModifierSetModifierAssnsDao msmDao = new ModifierSetModifierAssnsDao(APP);
+            ModifierSetProductAssnsDao mspDao = new ModifierSetProductAssnsDao(APP);
+
+            Response<ModifierSetAllAssnResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getModifierSetAssnLists(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    boolean success1 = msmDao.setModifierSetModifierAssns(
+                            response.getDto().getModifierAssns());
+                    addProgress(response.getDto().getModifierAssns());
+
+                    boolean success2 = mspDao.setModifierSetProductAssns(
+                            response.getDto().getProductAssns());
+                    addProgress(response.getDto().getProductAssns());
+
+                    if (success1 && success2) {
+                        result = DataSyncResult.Complete;
+                    } else {
+                        if (!success1) {
+                            errorText =
+                                    "ModifierSetModifierAssnsDao.setModifierSetModifierAssns() failed";
+                        } else {
+                            errorText =
+                                    "ModifierSetProductAssnsDao.setModifierSetProductAssns() failed";
+                        }
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class ProductModifierSetAssnsRunner extends PagedBaseRunner {
+        ProductModifierSetAssnsRunner(int pageSize) {
+            super(pageSize);
+        }
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            ProductModifierSetAssnsDao dao = new ProductModifierSetAssnsDao(APP);
+
+            // get normal product-modifierset assns
+            if (!getProductModifierSetAssns(dao, false)) {
+                return;
+            }
+
+            // get generated (fake) product-modifierset assns
+            if (!getProductModifierSetAssns(dao, true)) {
+                return;
+            }
+
+            result = DataSyncResult.Complete;
+        }
+
+        private boolean getProductModifierSetAssns(ProductModifierSetAssnsDao dao,
+                boolean isFakeModifierSetAssns) {
+            resetPagingFilter();
+
+            while (previousCursor != nextCursor
+                    || isFirstPage) {
+                incrementPageCount();
+
+                if (isFakeModifierSetAssns) {
+                    // set to false here so dao doesn't erase the non-fake assns
+                    isFirstPage = false;
+                }
+
+                Response<ProductModifierSetAssnListResponseDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(WebServices.getProductModifierSetAssnList(
+                            getAuthToken(), pagingFilter, isFakeModifierSetAssns));
+                    markEndTime();
+                    if ((response.isSuccessful()
+                            && response.getDto().getData() != null)
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() != null) {
+                    try {
+                        if (dao.setProductModifierSetAssns(response.getDto().getData(),
+                                isFirstPage)) {
+                            addProgress(response.getDto().getData());
+                            isFirstPage = false;
+                        } else {
+                            errorText =
+                                    "ProductModifierSetAssnsDao.setProductModifierSetAssns() failed";
+                            return false;
+                        }
+                    } catch (Exception e) {
+                        LogHelper.write(TAG, e);
+                        errorText = getErrorText(e);
+                        return false;
+                    }
+
+                    previousCursor = response.getDto().getPreviousCursor();
+                    nextCursor = response.getDto().getNextCursor();
+
+                    if (nextCursor != 0) {
+                        pagingFilter.setCursor(nextCursor);
+                    }
+                } else if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() == null) {
+                    errorText = "Response successful but no data returned";
+                    return false;
+                } else {
+                    errorText = getErrorText(response);
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    private class TaxesRunner extends PagedBaseRunner {
+        TaxesRunner(int pageSize) {
+            super(pageSize);
+        }
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            TaxesDao dao = new TaxesDao(APP);
+
+            Response<TaxListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.taxApi().getTaxes(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setTaxes(response.getDto().getTaxList())) {
+                        addProgress(response.getDto().getTaxList());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "TaxesDao.setTaxes() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    /**
+     * Runner that fetches all of the:
+     * - Taxes assigned to Products
+     * - Taxes applied to Manual (Ad Hoc) items
+     * - Taxes applied to Terminal Product items
+     * - Taxes applied to Quick Sale items
+     *
+     * @see ProductTaxResponseDto
+     * @see CartObjectExtensions#isAdHocItem(CartObject)
+     */
+    private class ProductTaxesRunner extends PagedBaseRunner {
+        ProductTaxesRunner(int pageSize) {
+            super(pageSize);
+        }
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            ProductTaxesDao dao = new ProductTaxesDao(APP);
+
+            // inventory product taxes
+
+            resetPagingFilter();
+
+            while (previousCursor != nextCursor
+                    || isFirstPage) {
+                incrementPageCount();
+
+                Response<ProductTaxListResponseDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(
+                            WebServices.getProductTaxList(getAuthToken(), pagingFilter));
+                    markEndTime();
+                    if ((response.isSuccessful()
+                            && response.getDto().getData() != null)
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() != null) {
+                    try {
+                        if (dao.setProductTaxes(response.getDto().getData(), isFirstPage)) {
+                            addProgress(response.getDto().getData());
+                            isFirstPage = false;
+                        } else {
+                            errorText = "ProductTaxesDao.setProductTaxes() (inventory) failed";
+                            return;
+                        }
+                    } catch (Exception e) {
+                        LogHelper.write(TAG, e);
+                        errorText = getErrorText(e);
+                        return;
+                    }
+
+                    previousCursor = response.getDto().getPreviousCursor();
+                    nextCursor = response.getDto().getNextCursor();
+
+                    if (nextCursor != 0) {
+                        pagingFilter.setCursor(nextCursor);
+                    }
+                } else if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() == null) {
+                    errorText = "Response successful but no data returned";
+                    return;
+                } else {
+                    errorText = getErrorText(response);
+                    result = getUnsuccessfulResultType(response);
+                    return;
+                }
+            }
+
+            // active location level product taxes
+
+            resetPagingFilter();
+            incrementPageCount();
+
+            // set to false immediately to prevent tax table from being cleared
+            isFirstPage = false;
+
+            Response<ManualItemTaxListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                // The 'Get Ad Hoc Item Tax List' API returns all active taxes for the
+                // location (including taxes applied to Manual items, Terminal Product items,
+                // and Quick Sale items).
+                response = new Response<>(
+                        WebServices.taxApi().getTaxesWithLocationAttributes(getAuthToken()));
+                markEndTime();
+                if ((response.isSuccessful()
+                        && response.getDto().getLocationLevelTaxes() != null)
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()
+                    && response.getDto().getLocationLevelTaxes() != null) {
+                try {
+                    List<ProductTaxResponseDto> locationLevelTaxes =
+                            response.getDto().getLocationLevelTaxes();
+
+                    LogHelper.write(Level.FINE, TAG,
+                            "Saving " + locationLevelTaxes.size() + " location level item taxes");
+                    if (dao.setProductTaxes(locationLevelTaxes, false)) {
+                        addProgress(locationLevelTaxes);
+                        dao.updateTaxesWithLocationAttributes();
+                    } else {
+                        errorText = "ProductTaxesDao.setProductTaxes() (location taxes) failed";
+                        return;
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                    return;
+                }
+            } else if (response != null
+                    && response.isSuccessful()
+                    && response.getDto().getLocationLevelTaxes() == null) {
+                errorText = "Response successful but no data returned";
+                return;
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+                return;
+            }
+
+            result = DataSyncResult.Complete;
+        }
+    }
+
+    private class DiscountsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            DiscountsDao discountsDao = new DiscountsDao(APP);
+            UsersDao usersDao = new UsersDao(APP);
+
+            DiscountResponseExpander expander = new DiscountResponseExpander();
+            expander.setExpandUsers(true);
+
+            Response<DiscountResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getDiscountList(getAuthToken(), true,
+                        expander));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (discountsDao.setDiscounts(response.getDto().getDiscounts())) {
+                        addProgress(response.getDto().getDiscounts());
+                        if (usersDao.setDiscountUserAssns(response.getDto().getDiscountUsers())) {
+                            addProgress(response.getDto().getDiscountUsers());
+                            result = DataSyncResult.Complete;
+                        } else {
+                            errorText = "UsersDao.setDiscountUserAssns() failed";
+                        }
+                    } else {
+                        errorText = "DiscountsDao.setDiscounts() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class DiscountProductAssnsRunner extends PagedBaseRunner {
+        DiscountProductAssnsRunner(int pageSize) {
+            super(pageSize);
+        }
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            DiscountsDao dao = new DiscountsDao(APP);
+
+            // discount-product assns
+
+            resetPagingFilter();
+
+            while (previousCursor != nextCursor
+                    || isFirstPage) {
+                incrementPageCount();
+
+                Response<DiscountProductAssnListResponseDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(WebServices.getDiscountProductAssnList(getAuthToken(),
+                            pagingFilter));
+                    markEndTime();
+                    if ((response.isSuccessful()
+                            && response.getDto().getData() != null)
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() != null) {
+                    try {
+                        if (dao.setDiscountProductAssns(response.getDto().getData(), isFirstPage)) {
+                            addProgress(response.getDto().getData());
+                            isFirstPage = false;
+                        } else {
+                            errorText = "DiscountsDao.setDiscountProductAssns() failed";
+                            return;
+                        }
+                    } catch (Exception e) {
+                        LogHelper.write(TAG, e);
+                        errorText = getErrorText(e);
+                        return;
+                    }
+
+                    previousCursor = response.getDto().getPreviousCursor();
+                    nextCursor = response.getDto().getNextCursor();
+
+                    if (nextCursor != 0) {
+                        pagingFilter.setCursor(nextCursor);
+                    }
+                } else if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() == null) {
+                    errorText = "Response successful but no data returned";
+                    return;
+                } else {
+                    errorText = getErrorText(response);
+                    result = getUnsuccessfulResultType(response);
+                    return;
+                }
+            }
+
+            result = DataSyncResult.Complete;
+        }
+    }
+
+    private class PromotionsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            PromotionsDao dao = new PromotionsDao(APP);
+
+            Response<PromotionListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getPromotionList(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setPromotions(response.getDto().getPromotions())) {
+                        addProgress(response.getDto().getPromotions());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "PromotionsDao.setPromotions() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class PromotionProductAssnsRunner extends PagedBaseRunner {
+        PromotionProductAssnsRunner(int pageSize) {
+            super(pageSize);
+        }
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            PromotionsDao dao = new PromotionsDao(APP);
+
+            // promotion-product assns
+
+            resetPagingFilter();
+
+            while (previousCursor != nextCursor
+                    || isFirstPage) {
+                incrementPageCount();
+
+                Response<PromotionProductAssnListResponseDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(WebServices.getPromotionProductAssnList(
+                            getAuthToken(), pagingFilter));
+                    markEndTime();
+                    if ((response.isSuccessful()
+                            && response.getDto().getData() != null)
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() != null) {
+                    try {
+                        if (dao.setPromotionProductAssns(response.getDto().getData(),
+                                isFirstPage)) {
+                            addProgress(response.getDto().getData());
+                            isFirstPage = false;
+                        } else {
+                            errorText = "PromotionsDao.setPromotionProductAssns() failed";
+                            return;
+                        }
+                    } catch (Exception e) {
+                        LogHelper.write(TAG, e);
+                        errorText = getErrorText(e);
+                        return;
+                    }
+
+                    previousCursor = response.getDto().getPreviousCursor();
+                    nextCursor = response.getDto().getNextCursor();
+
+                    if (nextCursor != 0) {
+                        pagingFilter.setCursor(nextCursor);
+                    }
+                } else if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() == null) {
+                    errorText = "Response successful but no data returned";
+                    return;
+                } else {
+                    errorText = getErrorText(response);
+                    result = getUnsuccessfulResultType(response);
+                    return;
+                }
+            }
+
+            result = DataSyncResult.Complete;
+        }
+    }
+
+    private class SalesEventsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            PromotionsDao dao = new PromotionsDao(APP);
+
+            Response<SalesEventListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getSalesEventList(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setSalesEvents(response.getDto().getSalesEvents())) {
+                        addProgress(response.getDto().getSalesEvents());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "PromotionsDao.setSalesEvents() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class SalesEventPromotionAssnsRunner extends PagedBaseRunner {
+        SalesEventPromotionAssnsRunner(int pageSize) {
+            super(pageSize);
+        }
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            PromotionsDao dao = new PromotionsDao(APP);
+
+            // event-promotion assns
+
+            resetPagingFilter();
+
+            while (previousCursor != nextCursor
+                    || isFirstPage) {
+                incrementPageCount();
+
+                Response<SalesEventPromotionAssnListResponseDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(WebServices.getSalesEventPromotionAssnList(
+                            getAuthToken(), pagingFilter));
+                    markEndTime();
+                    if ((response.isSuccessful()
+                            && response.getDto().getData() != null)
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() != null) {
+                    try {
+                        if (dao.setSalesEventPromotionAssns(response.getDto().getData(),
+                                isFirstPage)) {
+                            addProgress(response.getDto().getData());
+                            isFirstPage = false;
+                        } else {
+                            errorText = "PromotionsDao.setSalesEventPromotionAssns() failed";
+                            return;
+                        }
+                    } catch (Exception e) {
+                        LogHelper.write(TAG, e);
+                        errorText = getErrorText(e);
+                        return;
+                    }
+
+                    previousCursor = response.getDto().getPreviousCursor();
+                    nextCursor = response.getDto().getNextCursor();
+
+                    if (nextCursor != 0) {
+                        pagingFilter.setCursor(nextCursor);
+                    }
+                } else if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() == null) {
+                    errorText = "Response successful but no data returned";
+                    return;
+                } else {
+                    errorText = getErrorText(response);
+                    result = getUnsuccessfulResultType(response);
+                    return;
+                }
+            }
+
+            result = DataSyncResult.Complete;
+        }
+    }
+
+    private class IdentifiersRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            IdentifiersDao dao = new IdentifiersDao(APP);
+
+            Response<IdentifierListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getIdentifierList(getAuthToken(), mAccountId,
+                        mAccountLocationId));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setIdentifiers(response.getDto().getIdentifierList())) {
+                        addProgress(response.getDto().getIdentifierList());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "IdentifiersDao.setIdentifiers() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class StationsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            StationsDao dao = new StationsDao(APP);
+
+            Response<StationListResponseDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getStationList(getAuthToken(), mAccountId,
+                        mAccountLocationId));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                // get previous stations before overwriting for pref cleanup
+                List<StationDto> previousStations = StationHelper.getStations();
+
+                // cleanup orphaned station prefs
+                if (previousStations != null) {
+                    List<StationDto> newStations = StationHelper.getStations();
+                    for (StationDto previousStation : previousStations) {
+                        int stationId = previousStation.getId();
+                        boolean matchFound = false;
+
+                        if (newStations != null) {
+                            for (StationDto newStation : newStations) {
+                                if (previousStation.getId() == newStation.getId()) {
+                                    matchFound = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!matchFound) {
+                            PrefHelper.remove(PrinterHelper.getDeviceIdKey(stationId));
+                            PrefHelper.remove(PrinterHelper.getConnectionTypeIdKey(stationId));
+                            PrefHelper.remove(PrinterHelper.getAddressKey(stationId));
+                        }
+                    }
+                }
+
+                // transfer legacy printer prefs to new station prefs
+                LegacyPrefTransferHelper.transferLegacyPrinterPrefs();
+
+                try {
+                    if (dao.setStations(response.getDto().getStationList())) {
+                        addProgress(response.getDto().getStationList());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "StationsDao.setStations() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class ProgramTypesRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            Response<ProgramTypeListDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getProgramTypes(
+                        getAuthToken(), mAccountLocationId));
+                markEndTime();
+                if (response.isSuccessful() || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null && response.isSuccessful()) {
+                try {
+                    if (response.getDto() != null) {
+                        ProgramTypeListDto dto = response.getDto();
+                        List<ProgramTypeDto> programTypes = dto.getProgramTypes();
+
+                        // Surcharge and Cash Discount (sync group requires pref lock)
+                        synchronized (PrefHelper.LOCK) {
+                            ProgramTypeHelper.updateProgramTypeConfig(programTypes);
+                        }
+                    }
+                    addProgress(1);
+                    result = DataSyncResult.Complete;
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class LoyaltyProgramRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            Response<LoyaltyProgramDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getLoyaltyProgram(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null && response.isSuccessful()) {
+                try {
+                    LoyaltyProgramDto dto = response.getDto();
+
+                    synchronized (PrefHelper.LOCK) {
+                        PrefHelper.set(PrefKeys.LOYALTY_IS_ACTIVE, dto.isActive());
+                        if (dto.isActive()) {
+                            if (!TextUtils.isEmpty(dto.getProgramName())) {
+                                PrefHelper.set(PrefKeys.LOYALTY_PROGRAM_NAME, dto.getProgramName());
+                            }
+                            if (dto.getRedemptionThreshold() != null) {
+                                PrefHelper.set(PrefKeys.LOYALTY_REDEMPTION_THRESHOLD,
+                                        dto.getRedemptionThreshold());
+                            }
+                            if (dto.getRedemptionThreshold() != null) {
+                                PrefHelper.set(PrefKeys.LOYALTY_POINT_VALUE, dto.getPointValue());
+                            }
+                            if (dto.getVipMinTransactions() != null) {
+                                PrefHelper.set(PrefKeys.LOYALTY_VIP_MIN_TRANSACTIONS,
+                                        dto.getVipMinTransactions());
+                            }
+                            if (dto.getVipMinSpent() != null) {
+                                PrefHelper
+                                        .set(PrefKeys.LOYALTY_VIP_MIN_SPENT, dto.getVipMinSpent());
+                            }
+                            PrefHelper.set(PrefKeys.LOYALTY_PRINT_MESSAGE_ON_RECEIPT,
+                                    dto.isPrintMessageOnReceipt());
+                        } else {
+                            PrefHelper.remove(PrefKeys.LOYALTY_PROGRAM_NAME);
+                            PrefHelper.remove(PrefKeys.LOYALTY_REDEMPTION_THRESHOLD);
+                            PrefHelper.remove(PrefKeys.LOYALTY_POINT_VALUE);
+                            PrefHelper.remove(PrefKeys.LOYALTY_VIP_MIN_TRANSACTIONS);
+                            PrefHelper.remove(PrefKeys.LOYALTY_VIP_MIN_SPENT);
+                            PrefHelper.remove(PrefKeys.LOYALTY_PRINT_MESSAGE_ON_RECEIPT);
+                        }
+                    }
+
+                    addProgress(1);
+
+                    result = DataSyncResult.Complete;
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class ReceiptLogoRunner extends BaseRunner {
+        private final String mReceiptLogoUrl;
+
+        ReceiptLogoRunner(String receiptLogoUrl) {
+            mReceiptLogoUrl = receiptLogoUrl;
+        }
+
+        @Override
+        public void run() {
+            // disregard errors in this runner for now
+            result = DataSyncResult.Complete;
+            //    result = DataSyncResult.Error;
+
+            String cachedUrl = PrefHelper.get(PrefKeys.RECEIPT_LOGO_URL, "");
+            String receiptImageFilePath = FileHelper.getFilesDir(APP) +
+                    Hardware.PRINTER_FILENAME_RECEIPTIMAGE;
+
+            if (TextUtils.isEmpty(mReceiptImageUrl)) {
+                FileHelper.deleteFile(receiptImageFilePath);
+                result = DataSyncResult.Complete;
+            } else {
+                boolean force = mForceSync || !mReceiptImageUrl.equals(cachedUrl);
+
+                markStartTime();
+                StatusResponseDto response = WebServices.saveImage(mReceiptLogoUrl,
+                        receiptImageFilePath, force);
+                markEndTime();
+
+                if (response != null) {
+                    HttpStatusCode httpStatusCode = response.getHttpStatusCode();
+                    if (httpStatusCode == HttpStatusCode.OK
+                            || httpStatusCode == HttpStatusCode.NotModified) {
+                        PrefHelper.set(PrefKeys.RECEIPT_LOGO_URL, mReceiptImageUrl);
+                    } else {
+                        // bad data, but just clear existing logo and proceed normally
+                        FileHelper.deleteFile(receiptImageFilePath);
+                    }
+                    addProgress(1);
+                    result = DataSyncResult.Complete;
+                }
+            }
+        }
+    }
+
+    private class RegisterHardwareRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            boolean isSafeToOverwriteLocal;
+
+            if (PrefHelper.get(PrefKeys.HARDWARE_SETTINGS_SYNCED, false)) {
+                // settings have already been successfully saved to the server from this
+                // installation since the feature was introduced, so it's safe to assume updating
+                // from the server won't disrupt business.
+                LogEventHelper.saveEvent(AuditLevel.Debug, TAG,
+                        "Existing provisioned installation - overwriting local hardware settings");
+                isSafeToOverwriteLocal = true;
+            } else {
+                boolean isPrinterDefined = PrinterHelper.getRegisterHardwareDto(
+                        Hardware.PRINTER_REGISTER_STATIONID) != null;
+                if (!isPrinterDefined) {
+                    for (StationDto station : StationHelper.getStations()) {
+                        if (PrinterHelper.getRegisterHardwareDto(station.getId()) != null) {
+                            isPrinterDefined = true;
+                        }
+                    }
+                }
+                if (AccessoryDisplayHelper.getRegisterHardwareDto() != null
+                        || CfdHelper.getRegisterHardwareDto() != null
+                        || ScannerHelper.getRegisterHardwareDto() != null
+                        || TerminalHelper.getRegisterHardwareDto() != null
+                        || isPrinterDefined) {
+                    // this is the first time an existing installation has performed a hardware
+                    // sync since the feature was introduced, so we should update the server with
+                    // the prefs already defined locally to prevent disrupting business.
+                    LogEventHelper.saveEvent(AuditLevel.Debug, TAG,
+                            "Existing unprovisioned installation - overwriting server hardware settings");
+                    isSafeToOverwriteLocal = false;
+                } else {
+                    // this is a brand new installation, so we should update settings from the
+                    // server in case it's setup for an out-of-box experience.
+                    LogEventHelper.saveEvent(AuditLevel.Debug, TAG,
+                            "New installation - overwriting local hardware settings");
+                    isSafeToOverwriteLocal = true;
+                }
+            }
+
+            if (isSafeToOverwriteLocal) {
+                // overwrite local settings with server values
+                Response<RegisterHardwareListDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(WebServices.getRegisterHardwareList(getAuthToken(),
+                            AccountConfigHelper.getRegisterId()));
+                    markEndTime();
+                    if (response.isSuccessful()
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()) {
+                    if (HardwareSettingsHelper
+                            .saveHardwareList(response.getDto().getRegisterHardwareList())) {
+                        PrefHelper.set(PrefKeys.HARDWARE_SETTINGS_SYNCED, true);
+                        addProgress(response.getDto().getRegisterHardwareList());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "Error saving local hardware settings";
+                    }
+                } else {
+                    errorText = getErrorText(response);
+                    result = getUnsuccessfulResultType(response);
+                }
+            } else {
+                // send local settings to server
+                RegisterHardwareListDto request = new RegisterHardwareListDto();
+                request.setRegisterHardwareList(HardwareSettingsHelper.getHardwareList());
+
+                Response<StatusResponseDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(WebServices.updateRegisterHardwareList(getAuthToken(),
+                            AccountConfigHelper.getRegisterId(), request));
+                    markEndTime();
+                    if (response.isSuccessful()
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()) {
+                    PrefHelper.set(PrefKeys.HARDWARE_SETTINGS_SYNCED, true);
+                    addProgress(request.getRegisterHardwareList());
+                    result = DataSyncResult.Complete;
+                } else {
+                    errorText = getErrorText(response);
+                    result = getUnsuccessfulResultType(response);
+                }
+            }
+        }
+    }
+
+    private class MessagesRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            MessagesDao dao = new MessagesDao(APP);
+
+            Response<MessageListDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getMessageList(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null
+                    && response.isSuccessful()) {
+                try {
+                    if (dao.setMessages(response.getDto().getMessages())) {
+                        addProgress(response.getDto().getMessages());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "MessagesDao.setMessages() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private class ConstantsRunner extends BaseRunner {
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+
+            ConstantsDao dao = new ConstantsDao(APP);
+
+            Response<ConstantsDto> response = null;
+            resetAttemptCount();
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.getConstants(getAuthToken()));
+                markEndTime();
+                if (response.isSuccessful()
+                        || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null && response.isSuccessful()) {
+                try {
+                    // Set Loyalty Look Up Types
+                    Set<String> lookUpTypes = new HashSet<>();
+                    if (response.getDto().getLoyaltyLookUpTypeList() != null) {
+                        for (LoyaltyLookUpType lookUpType : response.getDto()
+                                .getLoyaltyLookUpTypeList()) {
+                            if (lookUpType == null) {
+                                // non-existent LoyaltyLookUpType was deserialized, skip it
+                                continue;
+                            }
+                            lookUpTypes.add(lookUpType.name());
+                        }
+                    }
+                    synchronized (PrefHelper.LOCK) {
+                        PrefHelper.set(PrefKeys.LOYALTY_LOOKUP_TYPES, lookUpTypes);
+                    }
+
+                    // Set Gateway Gift Card Capabilities
+                    // Will return null if the location does NOT have gift card enabled
+                    Set<String> gatewayGiftCardCapabilities = new HashSet<>();
+                    if (response.getDto().getGatewayGiftCardCapabilities() != null) {
+                        for (GatewayGiftCardCapabilities capability : response.getDto()
+                                .getGatewayGiftCardCapabilities()) {
+                            if (capability == null) {
+                                // non-existent GatewayGiftCardCapabilities was deserialized, skip it
+                                continue;
+                            }
+                            gatewayGiftCardCapabilities.add(capability.name());
+                        }
+                    }
+                    PrefHelper.set(PrefKeys.GATEWAY_GIFT_CARD_CAPABILITIES,
+                            gatewayGiftCardCapabilities);
+
+                    // Set Tender Reason Types
+                    if (response.getDto().getTenderReasonTypes() != null) {
+                        TenderReasonHelper.saveTenderReasonList(
+                                response.getDto().getTenderReasonTypes());
+                    }
+
+                    if (dao.setConstants(response.getDto())) {
+                        List<OrderTypeDto> orderTypes = DataAccessHelper.readOrderTypes(APP);
+                        InMemoryDataContainer.getInstance().setOrderTypes(orderTypes);
+
+                        // Continue to update the response progress as the Constants class evolves
+                        addProgress(response.getDto().getPrepaidCardRangeList());
+                        addProgress(response.getDto().getOrderTypes());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "ConstantsDao.setConstants() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    /*
+     * this runner is paged but requires a custom filter so we aren't extending PagedBaseRunner
+     */
+    private class TimeclockShiftsRunner extends BaseRunner {
+        private final int mPageSize;
+
+        TimeclockShiftsRunner(int pageSize) {
+            mPageSize = pageSize;
+        }
+
+        @Override
+        public void run() {
+            if (!AccountConfigHelper.isTimeClockEnabled()
+                    || (!mForceSync
+                    && PrefHelper.get(PrefKeys.IS_TIME_CLOCK_INITIAL_SHIFTS_ACQUIRED, false))) {
+                result = DataSyncResult.Complete;
+                return;
+            }
+
+            // Cancel the shift uploader if it's running
+            ShiftUploadHelper.cancel();
+
+            // Clear existing DB version pref
+            PrefHelper.remove(PrefKeys.TIMECLOCK_DB_VERSION);
+
+            // for the time being don't fail sync if this runner fails, always return Complete
+            // (errors will still be displayed in the provisioning report)
+            result = DataSyncResult.Complete;
+
+            ShiftsDao dao = new ShiftsDao(APP);
+
+            List<ShiftStatusType> statusTypes = new ArrayList<>();
+            statusTypes.add(ShiftStatusType.ClockedIn);
+            statusTypes.add(ShiftStatusType.ClockedOut);
+            statusTypes.add(ShiftStatusType.OnBreak);
+
+            TimeClockShiftFilter filter = new TimeClockShiftFilter();
+            filter.setShiftStatusTypes(statusTypes);
+            filter.setPageSize(mPageSize);
+            filter.setCursor(0);
+
+            int previousCursor = 0;
+            int nextCursor = 0;
+            boolean isFirstPage = true;
+
+            DateTime oldestPermitted = new DateTime().minusDays(Defaults.MAX_SHIFT_HISTORY_DAYS);
+
+            while (previousCursor != nextCursor
+                    || isFirstPage) {
+                incrementPageCount();
+
+                Response<ShiftListDto> response = null;
+                resetAttemptCount();
+                while (getAttemptCount() <= MAX_ATTEMPTS) {
+                    incrementAttemptCount();
+                    markStartTime();
+                    response = new Response<>(TimeClockWebServices.getShiftList(getAuthToken(),
+                            filter, true));
+                    markEndTime();
+                    if ((response.isSuccessful()
+                            && response.getDto().getData() != null)
+                            || !response.isRetryable()) {
+                        break;
+                    }
+                }
+
+                if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() != null) {
+                    if (!response.getDto().getData().isEmpty()
+                            && response.getDto().getData().get(0).getRevisionDateTime()
+                            .before(oldestPermitted.toDate())) {
+                        LogHelper.write(TAG, "Shift older than " + Defaults.MAX_SHIFT_HISTORY_DAYS +
+                                " day threshold (" + oldestPermitted.toDate().toString() +
+                                "), stopping");
+                        return;
+                    }
+                    try {
+                        List<Shift> shifts = new ArrayList<>();
+                        for (ShiftDto shiftDto : response.getDto().getData()) {
+                            try {
+                                Shift shift = new Shift(shiftDto, ShiftRecordStatus.Available,
+                                        true, false);
+                                shifts.add(shift);
+                            } catch (Exception e) {
+                                // skip this shift but allow conversion to continue
+                                LogEventHelper.saveEvent(AuditLevel.Debug, TAG,
+                                        "Shift " + shiftDto.getShiftNumber() +
+                                                " save failed: " + getErrorText(e));
+                            }
+                        }
+
+                        dao.setShifts(shifts, isFirstPage);
+                        addProgress(response.getDto().getData());
+                        isFirstPage = false;
+                    } catch (Exception e) {
+                        LogHelper.write(TAG, e);
+                        errorText = getErrorText(e);
+                        return;
+                    }
+
+                    previousCursor = response.getDto().getPreviousCursor();
+                    nextCursor = response.getDto().getNextCursor();
+
+                    if (nextCursor != 0) {
+                        filter.setCursor(nextCursor);
+                    }
+                } else if (response != null
+                        && response.isSuccessful()
+                        && response.getDto().getData() == null) {
+                    errorText = "Response successful but no data returned";
+                    return;
+                } else {
+                    errorText = getErrorText(response);
+                    return;
+                }
+            }
+
+            PrefHelper.set(PrefKeys.TIMECLOCK_DB_VERSION, TimeclockDb.VERSION);
+            PrefHelper.set(PrefKeys.IS_TIME_CLOCK_INITIAL_SHIFTS_ACQUIRED, true);
+
+            result = DataSyncResult.Complete;
+        }
+    }
+
+    private class VouchersRunner extends BaseRunner {
+
+        VouchersDao vouchersDao = new VouchersDao(APP);
+
+        @Override
+        public void run() {
+            result = DataSyncResult.Error;
+            Response<VoucherListResponseDto> response = null;
+
+            resetAttemptCount();
+
+            while (getAttemptCount() <= MAX_ATTEMPTS) {
+                incrementAttemptCount();
+                markStartTime();
+                response = new Response<>(WebServices.voucherApi().getVouchers(
+                        getAuthToken(),
+                        AccountConfigHelper.getAccountId(),
+                        AccountConfigHelper.getAccountLocationId()));
+                markEndTime();
+
+                if (response.isSuccessful() || !response.isRetryable()) {
+                    break;
+                }
+            }
+
+            if (response != null && response.isSuccessful()) {
+                try {
+                    List<VoucherDto> voucherDtos = new ArrayList<>();
+                    for (CustomTenderFieldsDto responseDto : response.getDto().getVouchers()) {
+                        voucherDtos.add(VoucherDto.from(responseDto));
+                    }
+                    if (vouchersDao.setVouchers(voucherDtos)) {
+                        addProgress(response.getDto().getVouchers());
+                        result = DataSyncResult.Complete;
+                    } else {
+                        errorText = "VouchersDao.setVouchers() failed";
+                    }
+                } catch (Exception e) {
+                    LogHelper.write(TAG, e);
+                    errorText = getErrorText(e);
+                }
+            } else {
+                errorText = getErrorText(response);
+                result = getUnsuccessfulResultType(response);
+            }
+        }
+    }
+
+    private abstract class BaseRunner implements Runnable {
+        public int progress;
+        public DataSyncResult result;
+        public String errorText;
+
+        private int mAttempt;
+        private int mTotalAttempts;
+        private int mTotalPages;
+        private long mStartTime;
+        private long mShortestTime;
+        private long mLongestTime;
+
+        public void addProgress(@Nullable List<? extends BaseDto> list) {
+            if (list != null) {
+                addProgress(list.size());
+            }
+        }
+
+        public void addProgress(int size) {
+            this.progress += size;
+            updateProgress();
+        }
+
+        public int getProgress() {
+            return this.progress;
+        }
+
+        public DataSyncResult getResult() {
+            return this.result;
+        }
+
+        protected void createCancelledResult() {
+            errorText = "Cancelled at retry attempt " + getAttemptCount();
+            result = DataSyncResult.Cancelled;
+        }
+
+        @WorkerThread
+        protected void delay(long durationMillis) {
+            final String runnerClass = getClass().getSimpleName();
+
+            try {
+                LogHelper.write(Level.INFO, TAG,
+                        runnerClass + " Delaying for " + durationMillis + " millis...");
+                Thread.sleep(durationMillis);
+            } catch (InterruptedException e) {
+                LogHelper.write(Level.WARNING, TAG,
+                        runnerClass + " Thread Interrupted While Sleeping!");
+                // Restore the interrupted state - if our delay between API retries
+                // gets interrupted, it's not the end of the world.
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        public void resetAttemptCount() {
+            if (mAttempt > 1) {
+                LogHelper.write(Level.INFO, TAG,
+                        getClass().getSimpleName() + " Resetting Attempt Count to Zero");
+            }
+            mAttempt = 0;
+        }
+
+        public void incrementAttemptCount() {
+            mAttempt++;
+            mTotalAttempts++;
+            LogHelper.write(TAG, getClass().getSimpleName() + " Attempt #: " + mAttempt);
+        }
+
+        public void incrementPageCount() {
+            mTotalPages++;
+        }
+
+        public int getAttemptCount() {
+            return mAttempt;
+        }
+
+        public int getTotalAttempts() {
+            return mTotalAttempts;
+        }
+
+        public int getTotalPages() {
+            return mTotalPages;
+        }
+
+        public void markStartTime() {
+            mStartTime = System.currentTimeMillis();
+        }
+
+        public void markEndTime() {
+            calculateTimes();
+        }
+
+        public long getShortestTime() {
+            return mShortestTime;
+        }
+
+        public long getLongestTime() {
+            return mLongestTime;
+        }
+
+        private void calculateTimes() {
+            long totalTime = System.currentTimeMillis() - mStartTime;
+            if (mShortestTime == 0) {
+                mShortestTime = totalTime;
+            } else if (totalTime < mShortestTime) {
+                mShortestTime = totalTime;
+            }
+
+            if (mLongestTime == 0) {
+                mLongestTime = totalTime;
+            } else if (totalTime > mLongestTime) {
+                mLongestTime = totalTime;
+            }
+        }
+    }
+
+    private abstract class PagedBaseRunner extends BaseRunner {
+        public final PagingFilter pagingFilter;
+        public final int pageSize;
+        public int previousCursor;
+        public int nextCursor;
+        boolean isFirstPage;
+
+        public PagedBaseRunner(int pageSize) {
+            this.pageSize = pageSize;
+            this.pagingFilter = new PagingFilter();
+
+            resetPagingFilter();
+        }
+
+        public void resetPagingFilter() {
+            this.pagingFilter.setPageSize(pageSize);
+            this.pagingFilter.setCursor(0);
+            this.previousCursor = 0;
+            this.nextCursor = 0;
+            this.isFirstPage = true;
+        }
+    }
+
+    private void updateProgress() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(getString(R.string.dialog_progress_sync));
+
+        int total = 0;
+        for (BaseRunner runner : mRunners) {
+            total += runner.getProgress();
+        }
+        if (total > 0) {
+            sb.append(" ").append(total).append(" ").append(
+                    getString(R.string.dialog_progress_sync_label_downloaded));
+        }
+
+        publishProgress(sb.toString());
+    }
+
+    /**
+     * @return the total progress made by all the runners.
+     */
+    private int getRunnersProgress() {
+        int total = 0;
+        for (BaseRunner runner : mRunners) {
+            total += runner.getProgress();
+        }
+
+        return total;
+    }
+
+    /**
+     * Updates the total progress count.
+     *
+     * @param progressCount count to be added to the total sync progress.
+     */
+    private void updateProgress(int progressCount) {
+        // Load total progress made by runners and set as starting value for use cases total progress.
+        if (useCasesTotalProgress == 0) {
+            useCasesTotalProgress = getRunnersProgress();
+        }
+
+        useCasesTotalProgress += progressCount;
+        StringBuilder sb = new StringBuilder();
+        sb.append(getString(R.string.dialog_progress_sync));
+
+        if (useCasesTotalProgress > 0) {
+            sb.append(" ").append(useCasesTotalProgress).append(" ").append(
+                    getString(R.string.dialog_progress_sync_label_downloaded));
+        }
+
+        publishProgress(sb.toString());
+    }
+
+    private String getErrorText(Exception e) {
+        return getErrorText(null, e);
+    }
+
+    private String getErrorText(String taskDescription, Exception e) {
+        if (taskDescription != null) {
+            return taskDescription + " :: " + e.toString();
+        }
+        return e.toString();
+    }
+
+    private <T extends BaseDto> String getErrorText(Response<T> response) {
+        return getErrorText(null, response);
+    }
+
+    private <T extends BaseDto> String getErrorText(String taskDescription, Response<T> response) {
+        StringBuilder sb = new StringBuilder();
+        if (taskDescription != null) {
+            sb.append(taskDescription);
+        }
+        int statusCode = response.getHttpStatusCode() != null ?
+                response.getHttpStatusCode().key : Ids.UNDEFINED;
+        if (statusCode != Ids.UNDEFINED) {
+            if (sb.length() > 0) {
+                sb.append(" :: ");
+            }
+            sb.append(statusCode);
+        }
+        if (!TextUtils.isEmpty(response.getMessage())) {
+            if (sb.length() > 0) {
+                sb.append(" :: ");
+            }
+            sb.append(response.getMessage());
+        }
+        if (response.isDtoNull()) {
+            if (sb.length() > 0) {
+                sb.append(" :: ");
+            }
+            sb.append("Response object null, most likely due to timeout");
+        }
+
+        return sb.toString();
+    }
+
+    private <T extends BaseDto> DataSyncResult getUnsuccessfulResultType(Response<T> response) {
+        if (response != null) {
+            if (response.isInvalidAuthToken()) {
+                return DataSyncResult.InvalidAuthToken;
+            } else if (response.isInvalidRegister()) {
+                return DataSyncResult.InvalidRegister;
+            } else if (response.isAccountInactive()) {
+                return DataSyncResult.AccountInactive;
+            } else if (response.isLocationInactive()) {
+                return DataSyncResult.LocationInactive;
+            }
+        }
+        return DataSyncResult.Error;
+    }
+
+    // post-sync alterations
+
+    private DataSyncResult runPostSyncAlterations() {
+        // cache product category colors
+        if (!cacheProductCategoryExtras()) {
+            return DataSyncResult.Error;
+        }
+
+        // cache tagProductAssn start/end times
+        if (!cacheTagProductAssnTimes()) {
+            return DataSyncResult.Error;
+        }
+
+        // perform flavor-specific alterations, if any
+        if (!FlavorHelper.runPostSyncAlterations(APP)) {
+            return DataSyncResult.Error;
+        }
+
+        return DataSyncResult.Complete;
+    }
+
+    private boolean cacheProductCategoryExtras() {
+        try {
+            ProductsDao dao = new ProductsDao(APP);
+            dao.setProductsCache();
+        } catch (Exception e) {
+            LogHelper.write(TAG, e);
+            LogHelper.write(TAG, getErrorText("cacheProductCategoryExtras", e));
+            return false;
+        }
+        return true;
+    }
+
+    private boolean cacheTagProductAssnTimes() {
+        try {
+            TagProductAssnsDao dao = new TagProductAssnsDao(APP);
+            dao.setTagProductAssnsCache();
+        } catch (Exception e) {
+            LogHelper.write(TAG, e);
+            LogHelper.write(TAG, getErrorText("cacheTagProductAssnTimes", e));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Loads and stores data in {@link InMemoryDataContainer} in a background thread.
+     */
+    public static void loadInMemoryData(@NonNull final Context context) {
+        if (InMemoryDataContainer.getInstance().isReady()) return;
+
+        new Thread(() -> populateDataContainer(context)).start();
+    }
+
+    private String getString(@StringRes int resourceId) {
+        return ResourceHelper.getString(resourceId);
+    }
+
+    /**
+     * This function is responsible to store the terms of use & privacy policy URLs in shared
+     * preference
+     *
+     * @param legalUrls Contains list of {@link LegalUrlsDto} which we get from server
+     */
+    private void saveBrandUrls(List<LegalUrlsDto> legalUrls) {
+        if (legalUrls != null) {
+            for (int i = 0; i < legalUrls.size(); i++) {
+                LegalUrlsDto item = legalUrls.get(i);
+                if (item != null && !item.getUrl().isEmpty()) {
+                    if (item.getLegalUrlType() == LegalUrlType.TermsOfUse) {
+                        accountConfig.setBrandTermsOfUseUrl(item.getUrl());
+                    } else if (item.getLegalUrlType() == LegalUrlType.PrivacyPolicy) {
+                        accountConfig.setBrandPrivacyPolicyUrl(item.getUrl());
+                    }
+                }
+            }
         }
     }
 }
