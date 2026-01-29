@@ -1,1399 +1,313 @@
-package com.imobile3.pos.data.module.batch
+package com.imobile3.pos.data.module.order
 
-import android.app.Activity
-import android.content.Context
-import android.content.SharedPreferences
-import android.database.Cursor
-import android.os.Handler
-import android.os.Looper
-import android.preference.PreferenceManager
-import com.imobile3.pos.BaseUnitTest
-import com.imobile3.pos.audits.constants.enums.AuditLevel
-import com.imobile3.pos.data.audit.FinancialAuditHelper
-import com.imobile3.pos.data.audit.LogEventHelper
+import com.imobile3.pos.data.module.account.config.AccountConfigHelper
 import com.imobile3.pos.data.module.account.repository.UserHelper
-import com.imobile3.pos.data.module.batch.close.TerminalBatchCloseHelper
-import com.imobile3.pos.data.peripherals.terminal.TerminalHelper
-import com.imobile3.pos.data.preferences.PrefHelper
-import com.imobile3.pos.library.constants.enums.PaymentTerminalAction
-import com.imobile3.pos.library.constants.enums.TenderRecordStatus
-import com.imobile3.pos.library.database.transaction.accessObjects.TransactionsDao
-import com.imobile3.pos.library.domainobjects.PaymentTerminalError
-import com.imobile3.pos.library.domainobjects.PaymentTerminalResponse
-import com.imobile3.pos.library.domainobjects.TenderAdditionalInfo
-import com.imobile3.pos.library.domainobjects.TxDbBatch
-import com.imobile3.pos.library.domainobjects.TxDbTender
-import com.imobile3.pos.library.interfaces.terminal.iM3Terminal
-import com.imobile3.pos.library.utils.LogHelper
-import com.imobile3.pos.library.webservices.enums.SwiperType
-import com.imobile3.pos.library.webservices.enums.TenderCreditStatusType
-import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
-import org.junit.Before
-import org.junit.Test
-import org.mockito.MockedStatic
-import org.mockito.Mockito
-import org.mockito.Mockito.mock
-import org.mockito.Mockito.mockStatic
-import org.mockito.Mockito.spy
-import org.mockito.kotlin.any
-import org.mockito.kotlin.argThat
-import org.mockito.kotlin.argumentCaptor
-import org.mockito.kotlin.doAnswer
-import org.mockito.kotlin.doNothing
-import org.mockito.kotlin.eq
-import org.mockito.kotlin.never
-import org.mockito.kotlin.verify
-import org.mockito.kotlin.verifyNoInteractions
-import org.mockito.kotlin.whenever
+import com.imobile3.pos.library.constants.enums.TransactionRecordStatus
+import com.imobile3.pos.library.constants.enums.TransactionSortType
+import com.imobile3.pos.library.webservices.enums.OrderStatusType
+import com.imobile3.pos.library.webservices.enums.PaymentType
+import com.imobile3.pos.library.webservices.enums.TransactionSourceType
+import com.imobile3.pos.library.webservices.enums.TransactionStatusType
+import com.imobile3.pos.library.webservices.enums.TransactionType
+import com.imobile3.pos.library.webservices.filters.TransactionSearchFilter
+import com.imobile3.pos.library.webservices.filters.TransactionSearchFilter.SearchQueryType
+import com.imobile3.pos.ui.search.SearchMode
+import com.imobile3.pos.ui.search.SearchMode.Amount
+import com.imobile3.pos.ui.search.SearchMode.CardLast4
+import com.imobile3.pos.ui.search.SearchMode.DateTime
+import com.imobile3.pos.ui.search.SearchMode.Name
+import com.imobile3.pos.ui.search.SearchMode.Tender
+import com.imobile3.pos.ui.search.SearchMode.TransactionNumber
 import java.math.BigDecimal
 import java.util.Date
 
-class TerminalBatchCloseHelperTest : BaseUnitTest() {
-    private lateinit var activity: Activity
-    private lateinit var context: Context
-    private lateinit var transactionDao: TransactionsDao
-    private lateinit var terminal: iM3Terminal
-    private lateinit var cursor: Cursor
-    private lateinit var handler: Handler
-    private lateinit var callbacks: TerminalBatchCloseHelper.TerminalBatchCloseCallbacks
-    private lateinit var callbacks2: TerminalBatchCloseHelper.TerminalBatchCloseCallbacks
-    private lateinit var batch: TxDbBatch
-    private lateinit var mockLooper: Looper
-    private lateinit var mockTerminalHelper: MockedStatic<TerminalHelper>
-    private lateinit var logHelperMock: MockedStatic<LogHelper>
-    private lateinit var helper: TerminalBatchCloseHelper
-    private lateinit var batchHelperMock: MockedStatic<BatchHelper>
-    private lateinit var MockprefHelper: MockedStatic<PrefHelper>
-    private lateinit var logEventHelperMock: MockedStatic<LogEventHelper>
-    private val error_msg = "Terminal not configured"
-    private lateinit var terminalCallbacks: TerminalBatchCloseHelper.TerminalCallbacks
-    private lateinit var terminaltask: TerminalBatchCloseHelper.TerminalBatchCloseTask
-    private lateinit var userHelper: MockedStatic<UserHelper>
-    private lateinit var mPreferenceManager: MockedStatic<PreferenceManager>
-    private lateinit var mFinancialAuditHelper: MockedStatic<FinancialAuditHelper>
+object TransactionSearchFilterFactory {
 
-    @Before
-    override fun setUp() {
-        super.setUp()
-        context = getApplication()
-        activity = mock(Activity::class.java)
-        MockprefHelper = mockStatic(PrefHelper::class.java)
-        mPreferenceManager = mockStatic(PreferenceManager::class.java)
-        transactionDao = mock(TransactionsDao::class.java)
-        terminal = mock(iM3Terminal::class.java)
-        cursor = mock(Cursor::class.java)
-        handler = mock(Handler::class.java)
-        callbacks = mock(TerminalBatchCloseHelper.TerminalBatchCloseCallbacks::class.java)
-        callbacks2 = mock(TerminalBatchCloseHelper.TerminalBatchCloseCallbacks::class.java)
-        mockLooper = mock(Looper::class.java)
-        mockTerminalHelper = mockStatic(TerminalHelper::class.java)
-        helper = mock(TerminalBatchCloseHelper::class.java, Mockito.CALLS_REAL_METHODS)
-        batchHelperMock = mockStatic(BatchHelper::class.java)
-        logHelperMock = mockStatic(LogHelper::class.java)
-        logEventHelperMock = mockStatic(LogEventHelper::class.java)
-        terminalCallbacks = helper.TerminalCallbacks()
-        terminaltask = spy(helper.TerminalBatchCloseTask(activity))
-        whenever(activity.mainLooper).thenReturn(mockLooper)
-        batch = TxDbBatch().apply {
-            batchNumber = 1001
-        }
-        mFinancialAuditHelper = mockStatic(FinancialAuditHelper::class.java)
-        whenever(
-            FinancialAuditHelper.cardTokenState(any(), any(), any(), any(), any())
-        ).thenAnswer { }
-        whenever(PreferenceManager.getDefaultSharedPreferences(context)).thenReturn(
-            mock(SharedPreferences::class.java)
+    fun createSearchFilter(
+        searchMode: SearchMode,
+        searchString: String?,
+        isFromScan: Boolean,
+        fromDateTime: Date?,
+        toDateTime: Date?,
+        fromAmount: BigDecimal?,
+        toAmount: BigDecimal?,
+        paymentType: PaymentType?
+    ) = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
+
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
         )
-        whenever(BatchHelper.getCurrentBatchNumber()).thenReturn(10)
-        whenever(BatchHelper.getCurrentLocalBatchNumber()).thenReturn(20)
-        userHelper = mockStatic(UserHelper::class.java)
-        whenever(UserHelper.getUserId()).thenReturn(10)
-        helper.mHandler = handler
-        helper.mTenderCursor = cursor
-        helper.mTerminal = terminal
-        helper.mBatch = batch
-        helper.mTransactionsDao = transactionDao
 
-    }
+        transactionTypes = listOf(
+            TransactionType.Normal,
+            TransactionType.Refund,
+            TransactionType.Split,
+            TransactionType.OpenItemRefund,
+            TransactionType.OpenAmountRefund
+        )
 
-    @After
-    override fun tearDown() {
-        super.tearDown()
-        mockTerminalHelper.close()
-        TerminalBatchCloseHelper.IS_RUNNING.set(false)
-        TerminalBatchCloseHelper.sCallbacks = null
-        MockprefHelper.close()
-        mPreferenceManager.close()
-        mFinancialAuditHelper.close()
-        logHelperMock.close()
-        batchHelperMock.close()
-        logEventHelperMock.close()
-        userHelper.close()
-    }
+        transactionStatusTypes = listOf(
+            TransactionStatusType.Completed,
+            TransactionStatusType.Refunded,
+            TransactionStatusType.RefundedItems,
+            TransactionStatusType.RefundedAmount,
+            TransactionStatusType.Cancelled,
+            TransactionStatusType.Resolved
+        )
 
-    @Test
-    fun `isRunning returns false when not started`() {
-        val result = TerminalBatchCloseHelper.isRunning()
-        assertFalse(result)
-    }
+        when (searchMode) {
+            TransactionNumber -> {
+                if (!searchString.isNullOrEmpty()) {
+                    searchQuery = searchString
+                    isSearchFromScan = isFromScan
+                    searchQueryType = SearchQueryType.TransNum
+                }
+            }
 
-    @Test
-    fun `isRunning returns true when started`() {
-        TerminalBatchCloseHelper.IS_RUNNING.set(true)
-        val result = TerminalBatchCloseHelper.isRunning()
-        assertTrue(result)
-    }
+            DateTime -> {
+                if (fromDateTime != null && toDateTime != null) {
+                    dateTimeStart = fromDateTime
+                    dateTimeEnd = toDateTime
+                    searchQueryType = SearchQueryType.DateTime
+                }
+            }
 
-    @Test
-    fun `addCallbacks creates HashSet when first callback is added`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        assertEquals(1, TerminalBatchCloseHelper.sCallbacks?.size)
-        assertTrue(TerminalBatchCloseHelper.sCallbacks?.contains(callbacks) == true)
-    }
+            Name -> {
+                if (!searchString.isNullOrEmpty()) {
+                    searchQuery = searchString
+                    searchQueryType = SearchQueryType.CardHolderName
+                }
+            }
 
-    @Test
-    fun `removeCallbacks removes the callback when called`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        assertEquals(1, TerminalBatchCloseHelper.sCallbacks?.size)
-        TerminalBatchCloseHelper.removeCallbacks(callbacks)
-        assertNull(TerminalBatchCloseHelper.sCallbacks)
-    }
+            CardLast4 -> {
+                if (!searchString.isNullOrEmpty()) {
+                    searchQuery = searchString
+                    searchQueryType = SearchQueryType.CardLast4
+                }
+            }
 
-    @Test
-    fun `cancel marks sIsCancelled as true when called`() {
-        TerminalBatchCloseHelper.cancel()
-        assertTrue(TerminalBatchCloseHelper.sIsCancelled)
-    }
+            Amount -> {
+                if (fromAmount != null && toAmount != null) {
+                    minimumAmount = fromAmount
+                    maximumAmount = toAmount
+                    searchQueryType = SearchQueryType.Amount
+                }
+            }
 
-    @Test
-    fun `logEvent writes Log when VerboseLoggingEnabled`() {
-        val message = "Test log message"
+            Tender -> {
+                if (paymentType != null) {
+                    if (paymentType == PaymentType.CustomTender
+                        && !searchString.isNullOrEmpty()
+                    ) {
+                        searchQuery = searchString
+                    }
+                    searchQueryPaymentType = paymentType
+                    searchQueryType = SearchQueryType.PaymentType
+                }
+            }
 
-        helper.logEvent(message)
-        logHelperMock.verify { LogHelper.write("TerminalBatchCloseHelper", message) }
-    }
-
-    @Test
-    fun `auditEvent should save and audit event with BatchNumbers`() {
-        val message = "Test audit message"
-        helper.auditEvent(message)
-        logEventHelperMock.verify {
-            LogEventHelper.saveEvent(
-                AuditLevel.Debug,
-                "TerminalBatchCloseHelper",
-                "Test audit message (Batch number: 10 / 20)"
-            )
+            else -> Unit
         }
     }
 
-    @Test
-    fun `auditSafTenderProcessing logs full Audit Message`() {
-        val additionalInfo = mock(TenderAdditionalInfo::class.java)
-
-        whenever(additionalInfo.terminalTenderSafId).thenReturn("SAF123")
-        whenever(additionalInfo.terminalTenderId).thenReturn("TID456")
-
-        val tender = mock(TxDbTender::class.java)
-        whenever(tender.tenderNumber).thenReturn(100)
-        whenever(tender.totalAmount).thenReturn(BigDecimal("5000"))
-        whenever(tender.redactedInfo).thenReturn("XXXX")
-        whenever(tender.additionalInfo).thenReturn(additionalInfo)
-
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.approvedAmount).thenReturn("5000")
-        whenever(response.redactedInfo).thenReturn("RESP_XXXX")
-        whenever(response.gatewayCardToken).thenReturn("TOKEN")
-        whenever(response.gatewayAuthCode).thenReturn("AUTH123")
-        whenever(response.gatewayAuthDateTime).thenReturn(Date(2025, 12, 29, 10, 0))
-
-        val description = "Test SAF processing"
-        helper.auditSafTenderProcessing(description, tender, response)
-
-        verify(helper).auditEvent(argThat { message ->
-            message.contains("TerminalBatchCloseHelper -> Test SAF processing") &&
-                    message.contains("TenderNumber 100") &&
-                    message.contains("Tender TotalAmount 5000") &&
-                    message.contains("TerminalTenderSafId SAF123") &&
-                    message.contains("Response GatewayCardToken TOKEN") &&
-                    message.contains("Response GatewayAuthCode AUTH123")
-        })
+    fun createQuarantineOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.RevisionAsc
+        transactionRecordStatusList = listOf(TransactionRecordStatus.InProgress)
     }
 
-    @Test
-    fun `callbackSafUploadInProgress posts and notify callbacks`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        helper.mCompletedCount = 2
-        helper.mTotalCount = 3
-        val runCaptor = argumentCaptor<Runnable>()
+    fun createAllOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
 
-        helper.callbackSafUploadInProgress()
-        verify(handler).post(runCaptor.capture())
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
+        )
 
-        runCaptor.firstValue.run()
-        verify(callbacks).TerminalBatchCloseOnSafUploadInProgress(2, 3)
-    }
+        transactionTypes = listOf(
+            TransactionType.Normal,
+            TransactionType.Refund,
+            TransactionType.Split,
+            TransactionType.OpenItemRefund,
+            TransactionType.OpenAmountRefund
+        )
 
-    @Test
-    fun `callbackSafUploadInProgress does nothing when no callbacks added`() {
-        TerminalBatchCloseHelper.removeCallbacks(callbacks)
-        helper.mCompletedCount = 2
-        helper.mTotalCount = 3
-        val runCaptor = argumentCaptor<Runnable>()
-
-        helper.callbackSafUploadInProgress()
-        verify(handler).post(runCaptor.capture())
-
-        runCaptor.firstValue.run()
-        verifyNoInteractions(callbacks)
-    }
-
-    @Test
-    fun `callbackSafUploadComplete notify all callbacks with count when called`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        TerminalBatchCloseHelper.addCallbacks(callbacks2)
-        helper.mCompletedCount = 4
-        helper.mTotalCount = 6
-
-        val captor = argumentCaptor<Runnable>()
-        helper.callbackSafUploadComplete()
-        verify(handler).post(captor.capture())
-
-        captor.firstValue.run()
-        verify(callbacks).TerminalBatchCloseOnSafUploadComplete(4, 6)
-        verify(callbacks2).TerminalBatchCloseOnSafUploadComplete(4, 6)
-    }
-
-    @Test
-    fun `callbackSafUploadComplete does nothing when no callback present`() {
-        TerminalBatchCloseHelper.removeCallbacks(callbacks)
-        TerminalBatchCloseHelper.removeCallbacks(callbacks2)
-        val captor = argumentCaptor<Runnable>()
-        helper.callbackSafUploadComplete()
-
-        verify(handler).post(captor.capture())
-        captor.firstValue.run()
-
-        verifyNoInteractions(callbacks)
-    }
-
-    @Test
-    fun `callbackSafTendersNotFound notify all callbacks`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        TerminalBatchCloseHelper.addCallbacks(callbacks2)
-        helper.callbackSafTendersNotFound()
-        val captor = argumentCaptor<Runnable>()
-        verify(handler).post(captor.capture())
-        captor.firstValue.run()
-        verify(callbacks).TerminalBatchCloseOnSafTendersNotFound()
-        verify(callbacks2).TerminalBatchCloseOnSafTendersNotFound()
-
-    }
-
-    @Test
-    fun `callbackBatchCloseInProgress notify all callbacks when called`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        TerminalBatchCloseHelper.addCallbacks(callbacks2)
-        helper.callbackBatchCloseInProgress()
-        val captor = argumentCaptor<Runnable>()
-        verify(handler).post(captor.capture())
-        captor.firstValue.run()
-        verify(callbacks).TerminalBatchCloseOnInProgress()
-        verify(callbacks2).TerminalBatchCloseOnInProgress()
-    }
-
-    @Test
-    fun `callbackOnComplete notify all callbacks when called`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        TerminalBatchCloseHelper.addCallbacks(callbacks2)
-        helper.callbackOnComplete()
-        val captor = argumentCaptor<Runnable>()
-        verify(handler).post(captor.capture())
-        captor.firstValue.run()
-        verify(callbacks).TerminalBatchCloseOnComplete()
-        verify(callbacks2).TerminalBatchCloseOnComplete()
-    }
-
-    @Test
-    fun `callbackOnCancelled notify all callbacks when called`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        TerminalBatchCloseHelper.addCallbacks(callbacks2)
-        helper.callbackOnCancelled()
-        val captor = argumentCaptor<Runnable>()
-        verify(handler).post(captor.capture())
-        captor.firstValue.run()
-
-        verify(callbacks).TerminalBatchCloseOnCancelled()
-        verify(callbacks2).TerminalBatchCloseOnCancelled()
-    }
-
-    @Test
-    fun `callbackOnError notify all callbacks when called`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        TerminalBatchCloseHelper.addCallbacks(callbacks2)
-        helper.callbackOnError()
-        val captor = argumentCaptor<Runnable>()
-        verify(handler).post(captor.capture())
-        captor.firstValue.run()
-
-        verify(callbacks).TerminalBatchCloseOnError()
-        verify(callbacks2).TerminalBatchCloseOnError()
-    }
-
-    @Test
-    fun `callbackOnBusy notify all callbacks when called`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        TerminalBatchCloseHelper.addCallbacks(callbacks2)
-        helper.callbackOnBusy()
-        val captor = argumentCaptor<Runnable>()
-        verify(handler).post(captor.capture())
-        captor.firstValue.run()
-
-        verify(callbacks).TerminalBatchCloseOnBusy()
-        verify(callbacks2).TerminalBatchCloseOnBusy()
-    }
-
-    @Test
-    fun `callbackTerminalConfigurationError notify all callbacks with error msg when called`() {
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        TerminalBatchCloseHelper.addCallbacks(callbacks2)
-        helper.callbackTerminalConfigurationError(error_msg)
-        val captor = argumentCaptor<Runnable>()
-        verify(handler).post(captor.capture())
-        captor.firstValue.run()
-
-        verify(callbacks).TerminalBatchCloseOnTerminalConfigurationError(error_msg)
-        verify(callbacks2).TerminalBatchCloseOnTerminalConfigurationError(error_msg)
-    }
-
-    @Test
-    fun `UploadSafTenders response sets payment response and clears wait when called`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.action).thenReturn(PaymentTerminalAction.UploadSafTenders)
-        helper.mWaitingForTerminalResponse = true
-
-        terminalCallbacks.iM3TerminalOnResponse(response)
-
-        assertEquals(response, helper.mPaymentTerminalResponse)
-        assertFalse(helper.mWaitingForTerminalResponse)
-    }
-
-    @Test
-    fun `GetSafTender response sets payment response`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.action).thenReturn(PaymentTerminalAction.GetSafTender)
-        terminalCallbacks.iM3TerminalOnResponse(response)
-
-        assertEquals(response, helper.mPaymentTerminalResponse)
-        assertFalse(helper.mWaitingForTerminalResponse)
-    }
-
-    @Test
-    fun `CloseBatch response sets batch close success`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.action).thenReturn(PaymentTerminalAction.CloseBatch)
-        whenever(response.isTerminalBatchEmpty).thenReturn(true)
-        helper.mBatchCloseSuccess = false
-        helper.mWaitingForTerminalResponse = true
-        terminalCallbacks.iM3TerminalOnResponse(response)
-        assertTrue(helper.mBatchCloseSuccess)
-        assertFalse(helper.mWaitingForTerminalResponse)
-    }
-
-    @Test
-    fun `ClearBatch response also sets batch close success`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.action).thenReturn(PaymentTerminalAction.ClearBatch)
-        whenever(response.isTerminalBatchEmpty).thenReturn(true)
-        terminalCallbacks.iM3TerminalOnResponse(response)
-        assertTrue(helper.mBatchCloseSuccess)
-    }
-
-    @Test
-    fun `Terminal error sets error flags and clear wait`() {
-        val error = mock(PaymentTerminalError::class.java)
-        whenever(error.friendlyMessage).thenReturn("Error")
-        whenever(error.detailedMessage).thenReturn("Details")
-        helper.mWaitingForTerminalResponse = true
-        terminalCallbacks.iM3TerminalOnError(error)
-
-        assertTrue(helper.mHasError)
-        assertFalse(helper.mBatchCloseSuccess)
-        assertFalse(helper.mWaitingForTerminalResponse)
-        assertFalse(helper.mReceivedSafNotFoundResponseForBatchAction)
-    }
-
-    @Test
-    fun `wasClearBatchSafTenderNotFound returns correct flag when called`() {
-        terminaltask.mWasClearBatchSafTenderNotFound = true
-        assertTrue(terminaltask.wasClearBatchSafTenderNotFound())
-
-        terminaltask.mWasClearBatchSafTenderNotFound = false
-        assertFalse(terminaltask.wasClearBatchSafTenderNotFound())
-    }
-
-    @Test
-    fun `handleSafUploadResponse triggers error when response is null`() {
-        doNothing().whenever(helper).callbackOnError()
-        terminaltask.handleSafUploadResponse(null)
-
-        verify(helper).callbackOnError()
-    }
-
-    @Test
-    fun `handleSafUploadResponse sets flag when saf not found`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.isSafTenderNotFound).thenReturn(true)
-
-        helper.mTotalCount = 0
-        helper.mHasError = false
-
-        doNothing().whenever(helper).callbackSafUploadComplete()
-        doNothing().whenever(terminaltask).closeBatch()
-        terminaltask.handleSafUploadResponse(response)
-
-        assertTrue(helper.mReceivedSafNotFoundResponseForBatchAction)
-    }
-
-    @Test
-    fun `handleSafUploadResponse triggers updateRemainingTenders when valid response is passed`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.isSafTenderNotFound).thenReturn(false)
-
-        doNothing().whenever(terminaltask).updateRemainingTenders()
-        terminaltask.handleSafUploadResponse(response)
-
-        verify(terminaltask).updateRemainingTenders()
-    }
-
-    @Test
-    fun `handleSafUploadResponse triggers onCancelled callback when saf not found and cancelled`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.isSafTenderNotFound).thenReturn(true)
-        TerminalBatchCloseHelper.sIsCancelled = true
-        helper.mHasError = false
-        helper.mTotalCount = 5
-        terminaltask.handleSafUploadResponse(response)
-
-        verify(helper).callbackOnCancelled()
-    }
-
-    @Test
-    fun `handleSafUploadResponse triggers updateRemainingTenders when saf not found`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.isSafTenderNotFound).thenReturn(true)
-        TerminalBatchCloseHelper.sIsCancelled = false
-        helper.mTotalCount = 2
-
-        doNothing().whenever(terminaltask).updateRemainingTenders()
-        terminaltask.handleSafUploadResponse(response)
-
-        verify(terminaltask).updateRemainingTenders()
-    }
-
-    @Test
-    fun `handleTenderResponse updates db and increment count when saf uploaded`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        val tender = mock(TxDbTender::class.java)
-        val transactionsDao = mock(TransactionsDao::class.java)
-        whenever(response.isSafTenderUploaded).thenReturn(true)
-        whenever(response.isSafTenderDeclined).thenReturn(false)
-        whenever(response.gatewayAuthCode).thenReturn("AUTH123")
-        whenever(tender.transactionNumber).thenReturn(1001L)
-        whenever(tender.tenderNumber).thenReturn(1)
-        whenever(tender.additionalInfo).thenReturn(TenderAdditionalInfo())
-
-        helper.mCompletedCount = 0
-        helper.mTransactionsDao = transactionsDao
-
-        terminaltask.handleTenderResponse(tender, response)
-        verify(transactionsDao).updateTender(
-            eq(1001L),
-            eq(1),
-            eq(TenderRecordStatus.Finalized),
-            eq(TenderCreditStatusType.Completed),
-            eq("AUTH123"),
-            any<TenderAdditionalInfo>(),
-            any<Date>()
+        transactionStatusTypes = listOf(
+            TransactionStatusType.Completed,
+            TransactionStatusType.Refunded,
+            TransactionStatusType.RefundedItems,
+            TransactionStatusType.RefundedAmount,
+            TransactionStatusType.Cancelled,
+            TransactionStatusType.Resolved
         )
     }
 
-    @Test
-    fun `handleTenderResponse set Declined status when saf uploaded and declined`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        val tender = mock(TxDbTender::class.java)
-        val transactionsDao = mock(TransactionsDao::class.java)
-        whenever(response.isSafTenderUploaded).thenReturn(true)
-        whenever(response.isSafTenderDeclined).thenReturn(true)
-        whenever(response.gatewayCardToken).thenReturn(null)
-        whenever(response.gatewayAuthCode).thenReturn("DECL123")
-        whenever(tender.transactionNumber).thenReturn(1001L)
-        whenever(tender.tenderNumber).thenReturn(1)
-        whenever(tender.additionalInfo).thenReturn(TenderAdditionalInfo())
-        helper.mCompletedCount = 0
-        helper.mTransactionsDao = transactionsDao
+    fun createMyOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
 
-        terminaltask.handleTenderResponse(tender, response)
-        verify(transactionsDao).updateTender(
-            eq(1001L),
-            eq(1),
-            eq(TenderRecordStatus.Finalized),
-            eq(TenderCreditStatusType.Declined),
-            eq("DECL123"),
-            any<TenderAdditionalInfo>(),
-            any<Date>()
+        userId = UserHelper.getUserId()
+
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
         )
-        assertEquals(1, helper.mCompletedCount)
+
+        transactionTypes = listOf(
+            TransactionType.Normal,
+            TransactionType.Refund,
+            TransactionType.Split,
+            TransactionType.OpenItemRefund,
+            TransactionType.OpenAmountRefund
+        )
+
+        transactionStatusTypes = listOf(
+            TransactionStatusType.Completed,
+            TransactionStatusType.Refunded,
+            TransactionStatusType.RefundedItems,
+            TransactionStatusType.RefundedAmount,
+            TransactionStatusType.Cancelled,
+            TransactionStatusType.Resolved
+        )
     }
 
-    @Test
-    fun `handleTenderResponse does nothing when saf not uploaded`() {
-        val response = mock(PaymentTerminalResponse::class.java)
-        val tender = mock(TxDbTender::class.java)
-        val transactionsDao = mock(TransactionsDao::class.java)
+    fun createOnlineOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
 
-        helper.mTransactionsDao = transactionsDao
-        whenever(response.isSafTenderUploaded).thenReturn(false)
-        whenever(response.isSafTenderNotFound).thenReturn(false)
-        helper.mCompletedCount = 0;
-        terminaltask.handleTenderResponse(tender, response)
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
+        )
 
-        verifyNoInteractions(transactionsDao)
-        assertEquals(0, helper.mCompletedCount)
+        transactionSourceTypes = listOf(TransactionSourceType.OnlineOrdering)
+
+        orderStatusTypes = listOf(OrderStatusType.Rejected, OrderStatusType.Completed)
+
+        transactionStatusTypes = listOf(
+            TransactionStatusType.Completed,
+            TransactionStatusType.Refunded,
+            TransactionStatusType.RefundedItems,
+            TransactionStatusType.RefundedAmount,
+            TransactionStatusType.Cancelled,
+            TransactionStatusType.Resolved
+        )
     }
 
-    @Test
-    fun `getUpdatedAdditionalInfo updates all non-null fields when correct tender passed`() {
-        val tender = TxDbTender().apply {
-            additionalInfo = TenderAdditionalInfo().apply {
-                gatewayIdentifier = "oldId"
-                gatewayGroupIdentifier = "oldGroup"
-                gatewayAuthDateTime = Date(2026, 1, 2, 9, 10)
-                gatewayAuthResponse = "oldResponse"
-                gatewayCardToken = "oldToken"
-                swiperType = SwiperType.PaxA920SmartTerminal
-            }
-        }
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.gatewayIdentifier).thenReturn("newId")
-        whenever(response.gatewayGroupIdentifier).thenReturn("newGroup")
-        whenever(response.gatewayAuthDateTime).thenReturn(Date(2026, 1, 2, 9, 15))
-        whenever(response.gatewayAuthResponse).thenReturn("newResponse")
-        whenever(response.gatewayCardToken).thenReturn("newToken")
-        whenever(response.swiperType).thenReturn(SwiperType.PaxA920SmartTerminal)
+    fun createMyRegisterFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
 
-        val updatedInfo = terminaltask.getUpdatedAdditionalInfo(tender, response)
+        registerId = AccountConfigHelper.getRegisterId()
 
-        assertEquals("newId", updatedInfo.gatewayIdentifier)
-        assertEquals(response.swiperType, SwiperType.PaxA920SmartTerminal)
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
+        )
+
+        transactionTypes = listOf(
+            TransactionType.Normal,
+            TransactionType.Refund,
+            TransactionType.Split,
+            TransactionType.OpenItemRefund,
+            TransactionType.OpenAmountRefund
+        )
+
+        transactionStatusTypes = listOf(
+            TransactionStatusType.Completed,
+            TransactionStatusType.Refunded,
+            TransactionStatusType.RefundedItems,
+            TransactionStatusType.Cancelled,
+            TransactionStatusType.Resolved
+        )
     }
 
-    @Test
-    fun `getUpdatedAdditionalInfo preserves old response when new response is null`() {
-        val tender = TxDbTender().apply {
-            additionalInfo = TenderAdditionalInfo().apply {
-                gatewayIdentifier = "oldId"
-                gatewayGroupIdentifier = "oldGroup"
-                gatewayAuthDateTime = Date(2026, 1, 2, 9, 10)
-                gatewayAuthResponse = "oldResponse"
-                gatewayCardToken = "oldToken"
-                swiperType = SwiperType.PaxA920SmartTerminal
-            }
-        }
-        val response = mock(PaymentTerminalResponse::class.java)
-        whenever(response.gatewayIdentifier).thenReturn(null)
-        whenever(response.gatewayGroupIdentifier).thenReturn(null)
-        whenever(response.gatewayAuthDateTime).thenReturn(null)
-        whenever(response.gatewayAuthResponse).thenReturn(null)
-        whenever(response.gatewayCardToken).thenReturn(null)
-        whenever(response.swiperType).thenReturn(null)
+    fun createCompletedOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
 
-        val updatedInfo = terminaltask.getUpdatedAdditionalInfo(tender, response)
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
+        )
 
-        assertEquals(updatedInfo.gatewayIdentifier, "oldId")
-        assertEquals(updatedInfo.gatewayGroupIdentifier, "oldGroup")
+        transactionTypes = listOf(TransactionType.Normal, TransactionType.Split)
+
+        transactionStatusTypes = listOf(
+            TransactionStatusType.Completed,
+            TransactionStatusType.Resolved
+        )
     }
 
-    @Test
-    fun `closeBatch calls callbackOnComplete on success`() {
-        helper.mBatchCloseSuccess = true
-        TerminalBatchCloseHelper.sIsCancelled = false
-        doAnswer {
-            helper.mWaitingForTerminalResponse = false
-            null
-        }.whenever(terminal).sendRequest(any())
-        terminaltask.closeBatch()
+    fun createInvoicesOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
 
-        verify(helper).callbackOnComplete()
+        isInvoiceTransaction = true
+
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
+        )
+
+        transactionTypes = listOf(
+            TransactionType.Normal,
+            TransactionType.Split
+        )
+
+        transactionStatusTypes = listOf(
+            TransactionStatusType.Completed,
+            TransactionStatusType.Cancelled,
+            TransactionStatusType.BadDebt
+        )
     }
 
-    @Test
-    fun `closeBatch calls callbackOnCancelled when cancelled`() {
-        helper.mBatchCloseSuccess = false
-        TerminalBatchCloseHelper.sIsCancelled = true
-        doAnswer {
-            helper.mWaitingForTerminalResponse = false
-            null
-        }.whenever(terminal).sendRequest(any())
-        terminaltask.closeBatch()
+    fun createVirtualTerminalOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
 
-        verify(helper).callbackOnCancelled()
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
+        )
+
+        transactionSourceTypes = listOf(TransactionSourceType.VirtualTerminal)
     }
 
-    @Test
-    fun `closeBatch calls callbackOnError when fails`() {
-        helper.mBatchCloseSuccess = false
-        TerminalBatchCloseHelper.sIsCancelled = false
-        doAnswer {
-            helper.mWaitingForTerminalResponse = false
-            null
-        }.whenever(terminal).sendRequest(any())
-        terminaltask.closeBatch()
+    fun createRefundedOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.CompletionDesc
 
-        verify(helper).callbackOnError()
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
+        )
+
+        transactionTypes = listOf(
+            TransactionType.Refund,
+            TransactionType.OpenItemRefund,
+            TransactionType.OpenAmountRefund
+        )
+
+        transactionStatusTypes = listOf(
+            TransactionStatusType.Completed,
+            TransactionStatusType.Refunded,
+            TransactionStatusType.RefundedItems,
+            TransactionStatusType.RefundedAmount,
+            TransactionStatusType.Resolved
+        )
     }
 
-    @Test
-    fun `updateRemainingTender triggers CancelCallback when tender Cancelled`() {
-        TerminalBatchCloseHelper.sIsCancelled = true
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        whenever(cursor.moveToNext()).thenReturn(false)
-        terminaltask.updateRemainingTenders()
-
-
-        verify(callbacks).TerminalBatchCloseOnCancelled()
-        verify(terminaltask, never()).closeBatch()
-    }
-
-    @Test
-    fun `updateRemainingTender continues BatchClose when tenders are pending`() {
-        TerminalBatchCloseHelper.sIsCancelled = false
-        helper.mTotalCount = 5
-        helper.mCompletedCount = 3
-        doNothing().whenever(terminaltask).closeBatch()
-
-        terminaltask.updateRemainingTenders()
-        verify(terminaltask).closeBatch()
-    }
-
-    @Test
-    fun `updateRemainingTender triggers CompleteCallback when all tender Completed`() {
-        TerminalBatchCloseHelper.sIsCancelled = false
-        helper.mTotalCount = 3
-        helper.mCompletedCount = 3
-        TerminalBatchCloseHelper.addCallbacks(callbacks)
-        terminaltask.updateRemainingTenders()
-
-        verify(callbacks).TerminalBatchCloseOnComplete()
-        verify(terminaltask).closeBatch()
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package com.imobile3.pos.data.module.batch.close;
-
-import android.app.Activity;
-import android.database.Cursor;
-import android.os.AsyncTask;
-import android.os.Handler;
-import android.text.TextUtils;
-
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
-import androidx.annotation.StringRes;
-import androidx.annotation.VisibleForTesting;
-
-import com.imobile3.pos.R;
-import com.imobile3.pos.audits.constants.enums.AuditLevel;
-import com.imobile3.pos.data.async.BaseAsyncUtilHelper;
-import com.imobile3.pos.data.audit.FinancialAuditHelper;
-import com.imobile3.pos.data.audit.LogEventHelper;
-import com.imobile3.pos.data.flavor.FlavorHelper;
-import com.imobile3.pos.data.module.batch.BatchHelper;
-import com.imobile3.pos.data.module.account.RuntimeConfigHelper;
-import com.imobile3.pos.data.module.account.repository.UserHelper;
-import com.imobile3.pos.data.peripherals.terminal.TerminalHelper;
-import com.imobile3.pos.data.peripherals.terminal.TerminalHelperCallbacks;
-import com.imobile3.pos.library.constants.enums.PaymentTerminalAction;
-import com.imobile3.pos.library.constants.enums.TenderRecordStatus;
-import com.imobile3.pos.library.constants.enums.TransactionRecordStatus;
-import com.imobile3.pos.library.database.transaction.accessObjects.TransactionsDao;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalError;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalRequest;
-import com.imobile3.pos.library.domainobjects.PaymentTerminalResponse;
-import com.imobile3.pos.library.domainobjects.TenderAdditionalInfo;
-import com.imobile3.pos.library.domainobjects.TxDbBatch;
-import com.imobile3.pos.library.domainobjects.TxDbTender;
-import com.imobile3.pos.library.interfaces.terminal.iM3Terminal;
-import com.imobile3.pos.library.utils.LogHelper;
-import com.imobile3.pos.library.webservices.enums.TenderCreditStatusType;
-import com.imobile3.pos.ui.ResourceHelper;
-
-import java.lang.ref.WeakReference;
-import java.util.Date;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.logging.Level;
-
-public class TerminalBatchCloseHelper extends BaseAsyncUtilHelper {
-
-    private static final String TAG = "TerminalBatchCloseHelper";
-    private static final boolean VERBOSE_LOGGING = true;
-
-    @VisibleForTesting
-    public static final AtomicBoolean IS_RUNNING = new AtomicBoolean(false);
-    @VisibleForTesting
-    public
-    TxDbBatch mBatch;
-    @VisibleForTesting
-    public int mCompletedCount, mTotalCount;
-    @VisibleForTesting
-    public boolean mWaitingForTerminalResponse, mBatchCloseSuccess, mHasError;
-    @VisibleForTesting
-    public PaymentTerminalResponse mPaymentTerminalResponse;
-
-    /**
-     * Keep track of whether the UploadSafTenders response returned 'NOT FOUND'
-     */
-    @VisibleForTesting
-    public boolean mReceivedSafNotFoundResponseForBatchAction;
-
-    @VisibleForTesting
-    public TransactionsDao mTransactionsDao;
-    @VisibleForTesting
-    public Cursor mTenderCursor;
-    @VisibleForTesting
-    public Handler mHandler;
-    @VisibleForTesting
-    public static boolean sIsCancelled;
-
-    @VisibleForTesting
-    public iM3Terminal mTerminal;
-
-    @Nullable
-    @VisibleForTesting
-    public static Set<TerminalBatchCloseCallbacks> sCallbacks;
-
-    public interface TerminalBatchCloseCallbacks {
-        void TerminalBatchCloseOnSafUploadInProgress(int current, int totalCount);
-
-        void TerminalBatchCloseOnSafUploadComplete(int current, int totalCount);
-
-        void TerminalBatchCloseOnSafTendersNotFound();
-
-        void TerminalBatchCloseOnInProgress();
-
-        void TerminalBatchCloseOnComplete();
-
-        void TerminalBatchCloseOnCancelled();
-
-        void TerminalBatchCloseOnBusy();
-
-        void TerminalBatchCloseOnTerminalConfigurationError(String message);
-
-        void TerminalBatchCloseOnError();
-    }
-
-    /**
-     * Starts the SAF update & batch close task on the terminal
-     *
-     * @param activity context required for terminal initialization
-     * @param batch batch to use for SAF tender search
-     * @param callbacks optional callbacks
-     */
-    public TerminalBatchCloseHelper(Activity activity, TxDbBatch batch,
-            TerminalBatchCloseCallbacks callbacks) {
-        if (activity == null
-                || batch == null
-                || batch.getBatchNumber() <= 0) {
-            throw new IllegalArgumentException("invalid context and/or batch");
-        }
-
-        mHandler = new Handler(activity.getMainLooper());
-
-        if (IS_RUNNING.compareAndSet(false, true)) {
-            mBatch = batch;
-            addCallbacks(callbacks);
-
-            mTransactionsDao = new TransactionsDao(getAPP());
-            mTerminal = TerminalHelper.getTerminal(activity, new TerminalCallbacks());
-
-            if (mTerminal == null) {
-                logEvent("No terminal configured, shutting down");
-                callbackTerminalConfigurationError(
-                        getString(R.string.payment_method_dialog_terminal_notconfigured));
-                IS_RUNNING.set(false);
-                return;
-            } else if (TerminalHelper.isSetupRequired() && !mTerminal.isTerminalSetupComplete()) {
-                logEvent("Terminal not setup, shutting down");
-                callbackTerminalConfigurationError(
-                        getString(R.string.payment_method_dialog_terminal_notsetup));
-                IS_RUNNING.set(false);
-                return;
-            }
-
-            new TerminalBatchCloseTask(activity).executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
-        } else {
-            logEvent("Already running, ignoring request");
-            callbackOnBusy();
-        }
-    }
-
-    public static boolean isRunning() {
-        return IS_RUNNING.get();
-    }
-
-    public static void addCallbacks(@NonNull TerminalBatchCloseCallbacks callbacks) {
-        if (sCallbacks == null) {
-            sCallbacks = new HashSet<>();
-        }
-        sCallbacks.add(callbacks);
-    }
-
-    public static void removeCallbacks(@Nullable TerminalBatchCloseCallbacks callbacks) {
-        if (sCallbacks == null || callbacks == null) {
-            return;
-        }
-        sCallbacks.remove(callbacks);
-        if (sCallbacks.isEmpty()) {
-            sCallbacks = null;
-        }
-    }
-
-    public static void cancel() {
-        sIsCancelled = true;
-    }
-
-    @VisibleForTesting
-    public class TerminalBatchCloseTask extends AsyncTask<Void, Void, Void> {
-
-        @NonNull
-        private final WeakReference<Activity> mActivityReference;
-
-        @VisibleForTesting
-        public TerminalBatchCloseTask(@NonNull Activity activity) {
-            mActivityReference = new WeakReference<>(activity);
-        }
-
-        @Override
-        protected void onPreExecute() {
-            super.onPreExecute();
-            sIsCancelled = false;
-            logEvent("BEGIN TASK");
-        }
-
-        @Override
-        protected Void doInBackground(Void... voids) {
-            mTenderCursor = mTransactionsDao.getStoreAndForwardTenders(mBatch.getBatchNumber());
-
-            mTotalCount = mTenderCursor.getCount();
-            if (mTotalCount > 0) {
-                auditEvent("SAF tenders in local batch, instructing terminal to upload");
-                callbackSafUploadInProgress();
-                uploadSafTenders();
-            } else {
-                auditEvent("No SAF tenders in local batch");
-                callbackSafTendersNotFound();
-                closeBatch();
-            }
-
-            mTenderCursor.close();
-
-            return null;
-        }
-
-        @Override
-        protected void onPostExecute(Void args) {
-            super.onPostExecute(args);
-            IS_RUNNING.set(false);
-            logEvent("END TASK");
-        }
-
-        private void uploadSafTenders() {
-            mPaymentTerminalResponse = null;
-            mWaitingForTerminalResponse = true;
-            mReceivedSafNotFoundResponseForBatchAction = false;
-            mTerminal.sendRequest(
-                    new PaymentTerminalRequest(PaymentTerminalAction.UploadSafTenders,
-                            RuntimeConfigHelper.isDemoMode()));
-
-            while (mWaitingForTerminalResponse) {
-                pause(500);
-            }
-
-            handleSafUploadResponse(mPaymentTerminalResponse);
-        }
-
-        @VisibleForTesting
-        public void handleSafUploadResponse(PaymentTerminalResponse response) {
-            if (response == null) {
-                auditEvent("Error with terminal SAF upload");
-                callbackOnError();
-            } else if (response.isSafTenderNotFound()) {
-                auditEvent("No SAF tenders found on terminal");
-                mReceivedSafNotFoundResponseForBatchAction = true;
-                if (sIsCancelled) {
-                    callbackOnCancelled();
-                } else {
-                    if (mHasError) {
-                        callbackOnError();
-                    } else {
-                        if (mTotalCount > 0) {
-                            // still need to update our local SAF tender records
-                            updateRemainingTenders();
-                        } else {
-                            callbackSafUploadComplete();
-                            closeBatch();
-                        }
-                    }
-                }
-            } else {
-                updateRemainingTenders();
-            }
-        }
-
-        @VisibleForTesting
-        public void updateRemainingTenders() {
-            LogHelper.invoked(Level.FINE, TAG);
-            outerloop:
-            do {
-                // "refresh" cursor after each full pass to take tender modifications into account
-                mTenderCursor.close();
-                mTenderCursor = mTransactionsDao.getStoreAndForwardTenders(mBatch.getBatchNumber());
-                if (!mTenderCursor.moveToFirst()) {
-                    LogHelper.write(TAG, "Cursor empty, breaking outer loop");
-                    break;
-                }
-                do {
-                    if (sIsCancelled) {
-                        LogHelper.write(TAG, "Cancelled, breaking outer loop");
-                        break outerloop;
-                    }
-
-                    TxDbTender tender = mTransactionsDao.getTxDbTenderFromCursor(mTenderCursor);
-                    String tenderSafId = tender.getAdditionalInfo().getTerminalTenderSafId();
-
-                    auditSafTenderProcessing("Getting SAF tender info from terminal",
-                            tender, null);
-
-                    mPaymentTerminalResponse = null;
-                    mWaitingForTerminalResponse = true;
-                    mTerminal.sendRequest(
-                            new PaymentTerminalRequest(PaymentTerminalAction.GetSafTender,
-                                    RuntimeConfigHelper.isDemoMode())
-                                    .setCustomData(FlavorHelper.getCustomTerminalRequestData())
-                                    .setTerminalTenderSafId(tenderSafId));
-
-                    while (mWaitingForTerminalResponse) {
-                        pause(500);
-                    }
-
-                    handleTenderResponse(tender, mPaymentTerminalResponse);
-
-                    callbackSafUploadInProgress();
-                } while (mTenderCursor.moveToNext());
-            } while (mCompletedCount < mTotalCount);
-
-            mTenderCursor.close();
-
-            if (sIsCancelled) {
-                callbackOnCancelled();
-            } else {
-                if (mHasError) {
-                    callbackOnError();
-                } else {
-                    callbackSafUploadComplete();
-                    closeBatch();
-                }
-            }
-        }
-
-        // Keep track of whether the UploadSafTenders response returned 'NOT FOUND'
-        @VisibleForTesting
-        public boolean mWasClearBatchSafTenderNotFound;
-
-        @VisibleForTesting
-        public boolean wasClearBatchSafTenderNotFound() {
-            return mWasClearBatchSafTenderNotFound;
-        }
-
-        @VisibleForTesting
-        public void handleTenderResponse(TxDbTender tender, PaymentTerminalResponse response) {
-            if (response == null) {
-                auditSafTenderProcessing("No SAF tender info returned from terminal",
-                        tender, response);
-            } else if (response.isSafTenderUploaded()) {
-                if (response.isSafTenderDeclined()) {
-                    FinancialAuditHelper.cardTokenState(
-                            "TerminalBatchCloseHelper -> SAF tender DECLINED",
-                            tender.getTenderNumber(),
-                            response.getApprovedAmount(),
-                            response.getRedactedInfo(),
-                            response.getGatewayCardToken()
-                    );
-
-                    TenderCreditStatusType tenderCreditStatusType = TenderCreditStatusType.Declined;
-                    if (!TextUtils.isEmpty(response.getGatewayCardToken())) {
-                        tenderCreditStatusType = TenderCreditStatusType.DeclinedRetry;
-                    }
-                    auditSafTenderProcessing(
-                            "SAF tender DECLINED, setting TenderCreditStatusType to " +
-                                    tenderCreditStatusType, tender, response);
-                    mTransactionsDao.updateTender(tender.getTransactionNumber(),
-                            tender.getTenderNumber(), TenderRecordStatus.Finalized,
-                            tenderCreditStatusType, response.getGatewayAuthCode(),
-                            getUpdatedAdditionalInfo(tender, response), new Date());
-                } else {
-                    FinancialAuditHelper.cardTokenState(
-                            "TerminalBatchCloseHelper -> SAF tender APPROVED",
-                            tender.getTenderNumber(),
-                            response.getApprovedAmount(),
-                            response.getRedactedInfo(),
-                            response.getGatewayCardToken()
-                    );
-
-                    auditSafTenderProcessing("SAF tender APPROVED", tender, response);
-                    mTransactionsDao.updateTender(tender.getTransactionNumber(),
-                            tender.getTenderNumber(), TenderRecordStatus.Finalized,
-                            TenderCreditStatusType.Completed, response.getGatewayAuthCode(),
-                            getUpdatedAdditionalInfo(tender, response), new Date());
-                }
-                mTransactionsDao.updateTransaction(tender.getTransactionNumber(),
-                        new Date(), UserHelper.getUserId(), TransactionRecordStatus.ReadyToUpload);
-            } else if (response.isSafTenderNotFound() ||
-                    hasReceivedSafNotFoundResponseForBatchAction()) {
-                // some terminals remove SAF tenders when voided/refunded, so mark as complete
-                auditSafTenderProcessing(
-                        "SAF tender not found on terminal (offline void), setting TenderCreditStatusType to Completed",
-                        tender, response);
-                mTransactionsDao.updateTender(tender.getTransactionNumber(),
-                        tender.getTenderNumber(), TenderRecordStatus.Finalized,
-                        TenderCreditStatusType.Completed, response.getGatewayAuthCode(),
-                        tender.getAdditionalInfo(), new Date());
-                mTransactionsDao.updateTransaction(tender.getTransactionNumber(),
-                        new Date(), UserHelper.getUserId(), TransactionRecordStatus.ReadyToUpload);
-            } else {
-                // not uploaded yet
-                auditSafTenderProcessing("SAF tender not uploaded yet", tender, response);
-                return;
-            }
-
-            mCompletedCount++;
-        }
-
-        /**
-         * We received a 'Not Found' response for either Batch Close or Batch Clear, so when we do
-         * LOCAL DETAIL REPORTS, the tenders may be approved, or uploaded, or not uploaded, or not
-         * found.
-         */
-        private boolean hasReceivedSafNotFoundResponseForBatchAction() {
-            return mReceivedSafNotFoundResponseForBatchAction;
-        }
-
-        @VisibleForTesting
-        public TenderAdditionalInfo getUpdatedAdditionalInfo(TxDbTender tender,
-                PaymentTerminalResponse response) {
-            TenderAdditionalInfo additionalInfo = tender.getAdditionalInfo();
-            if (response.getGatewayIdentifier() != null) {
-                additionalInfo.setGatewayIdentifier(response.getGatewayIdentifier());
-            }
-            if (response.getGatewayGroupIdentifier() != null) {
-                additionalInfo.setGatewayGroupIdentifier(response.getGatewayGroupIdentifier());
-            }
-            if (response.getGatewayAuthDateTime() != null) {
-                additionalInfo.setGatewayAuthDateTime(response.getGatewayAuthDateTime());
-            }
-            if (response.getGatewayAuthResponse() != null) {
-                additionalInfo.setGatewayAuthResponse(response.getGatewayAuthResponse());
-            }
-            if (response.getGatewayCardToken() != null) {
-                additionalInfo.setGatewayCardToken(response.getGatewayCardToken());
-            }
-            additionalInfo.setSwiperType(response.getSwiperType());
-
-            return additionalInfo;
-        }
-
-        @VisibleForTesting
-        public void closeBatch() {
-            Activity activity = mActivityReference.get();
-            if (activity == null) {
-                mBatchCloseSuccess = false;
-                callbackOnError();
-                return;
-            }
-
-            PaymentTerminalAction action = PaymentTerminalAction.CloseBatch;
-
-            // for scholastic just clear the terminal batch, don't close it
-            if (FlavorHelper.isScholastic()) {
-                action = PaymentTerminalAction.ClearBatch;
-            }
-
-            String userId = String.valueOf(UserHelper.getUserId());
-            auditEvent("UserId: " + userId + " instructing terminal to close batch");
-
-            callbackBatchCloseInProgress();
-
-            mPaymentTerminalResponse = null;
-            mWaitingForTerminalResponse = true;
-            mTerminal.sendRequest(new PaymentTerminalRequest(action)
-                    .setActivityClassToForeground(activity.getClass())
-                    .setCustomData(FlavorHelper.getCustomTerminalRequestData())
-                    .setUserId(userId));
-
-            while (mWaitingForTerminalResponse) {
-                pause(500);
-            }
-
-            if (mBatchCloseSuccess) {
-                callbackOnComplete();
-            } else if (sIsCancelled) {
-                callbackOnCancelled();
-            } else {
-                callbackOnError();
-            }
-        }
-    }
-
-    // terminal callbacks
-    @VisibleForTesting
-    public class TerminalCallbacks extends TerminalHelperCallbacks {
-        @Override
-        public void iM3TerminalOnResponse(PaymentTerminalResponse response) {
-            auditEvent("TerminalBatchCloseHelper terminal response action: "
-                    + response.getAction() + " / response object instance: " + response.hashCode());
-            switch (response.getAction()) {
-                case SendMessage:
-                    // Ignore all message events.
-                    return;
-
-                case UploadSafTenders:
-                case GetSafTender:
-                    mPaymentTerminalResponse = response;
-                    break;
-
-                case CloseBatch:
-                case ClearBatch:
-                    if (!response.isTerminalBatchEmpty()) {
-                        FinancialAuditHelper.terminalBatchClosed(TAG,
-                                BatchHelper.getCurrentBatchNumber(),
-                                BatchHelper.getCurrentLocalBatchNumber(), response);
-                    }
-                    mBatchCloseSuccess = true;
-                    break;
-
-                default:
-                    logEvent("Unsupported PaymentTerminalAction: " + response.getAction());
-            }
-
-            mWaitingForTerminalResponse = false;
-        }
-
-        @Override
-        public void iM3TerminalOnError(@NonNull PaymentTerminalError error) {
-            String friendlyMessage = error.getFriendlyMessage();
-            String detailedMessage = error.getDetailedMessage();
-            auditEvent("TerminalBatchCloseHelper terminal error: " + friendlyMessage +
-                    (detailedMessage != null ? " / " + detailedMessage : ""));
-            mHasError = true;
-            mBatchCloseSuccess = false;
-            mWaitingForTerminalResponse = false;
-            mReceivedSafNotFoundResponseForBatchAction = false;
-        }
-    }
-
-    // helpers
-
-    @VisibleForTesting
-    public void logEvent(String message) {
-        if (VERBOSE_LOGGING) {
-            LogHelper.write(TAG, message);
-        }
-    }
-
-    @VisibleForTesting
-    public void auditEvent(String message) {
-        LogEventHelper.saveEvent(AuditLevel.Debug, TAG, message + " (Batch number: "
-                + BatchHelper.getCurrentBatchNumber() + " / "
-                + BatchHelper.getCurrentLocalBatchNumber() + ")");
-    }
-
-    @VisibleForTesting
-    public void auditSafTenderProcessing(@NonNull String description,
-            @NonNull TxDbTender tender, @Nullable PaymentTerminalResponse response) {
-        String message = "TerminalBatchCloseHelper -> " + description + ":"
-                + " Cursor object instance " + mTenderCursor.hashCode()
-                + " / Tender object instance " + tender.hashCode()
-                + " / TenderNumber " + tender.getTenderNumber()
-                + " / Tender TotalAmount " + tender.getTotalAmount()
-                + " / Tender RedactedInfo " + tender.getRedactedInfo();
-
-        TenderAdditionalInfo additionalInfo = tender.getAdditionalInfo();
-        if (additionalInfo != null) {
-            message += " / TerminalTenderSafId " + additionalInfo.getTerminalTenderSafId()
-                    + " / TerminalTenderId " + additionalInfo.getTerminalTenderId()
-                    + " / TerminalTenderId " + additionalInfo.getTerminalTenderId()
-            ;
-        }
-
-        if (response != null) {
-            message += " Response object instance " + response.hashCode()
-                    + " / Response ApprovedAmount " + response.getApprovedAmount()
-                    + " / Response RedactedInfo " + response.getRedactedInfo()
-                    + " / Response GatewayCardToken " + response.getGatewayCardToken()
-                    + " / Response GatewayAuthCode " + response.getGatewayAuthCode()
-                    + " / Response GatewayAuthDateTime " + response.getGatewayAuthDateTime()
-            ;
-        }
-
-        auditEvent(message);
-    }
-
-    // callbacks
-
-    @VisibleForTesting
-    public void callbackSafUploadInProgress() {
-        // Lock in the values at the time this method was invoked.
-        final int completed = mCompletedCount;
-        final int total = mTotalCount;
-
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnSafUploadInProgress(completed, total);
-                }
-            }
-        });
-    }
-
-    @VisibleForTesting
-    public void callbackSafUploadComplete() {
-        // Lock in the values at the time this method was invoked.
-        final int completed = mCompletedCount;
-        final int total = mTotalCount;
-
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnSafUploadComplete(completed, total);
-                }
-            }
-        });
-    }
-
-    @VisibleForTesting
-    public void callbackSafTendersNotFound() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnSafTendersNotFound();
-                }
-            }
-        });
-    }
-
-    @VisibleForTesting
-    public void callbackBatchCloseInProgress() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnInProgress();
-                }
-            }
-        });
-    }
-
-    @VisibleForTesting
-    public void callbackOnComplete() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnComplete();
-                }
-            }
-        });
-    }
-
-    @VisibleForTesting
-    public void callbackOnCancelled() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnCancelled();
-                }
-            }
-        });
-    }
-
-    @VisibleForTesting
-    public void callbackOnBusy() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnBusy();
-                }
-            }
-        });
-    }
-
-    @VisibleForTesting
-    public void callbackTerminalConfigurationError(final String message) {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnTerminalConfigurationError(message);
-                }
-            }
-        });
-    }
-
-    @VisibleForTesting
-    public void callbackOnError() {
-        mHandler.post(() -> {
-            if (sCallbacks != null) {
-                for (TerminalBatchCloseCallbacks callbacks : sCallbacks) {
-                    callbacks.TerminalBatchCloseOnError();
-                }
-            }
-        });
-    }
-
-    private String getString(@StringRes int resourceId) {
-        return ResourceHelper.getString(resourceId);
+    fun createCancelledOrdersFilter() = TransactionSearchFilter().apply {
+        sortType = TransactionSortType.RevisionDesc
+
+        transactionRecordStatusList = listOf(
+            TransactionRecordStatus.ReadyToUpload,
+            TransactionRecordStatus.Historical
+        )
+
+        transactionTypes = listOf(
+            TransactionType.Normal,
+            TransactionType.Refund,
+            TransactionType.Split,
+            TransactionType.OpenItemRefund,
+            TransactionType.OpenAmountRefund
+        )
+
+        transactionStatusTypes = listOf(TransactionStatusType.Cancelled)
     }
 }
